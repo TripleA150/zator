@@ -106,6 +106,16 @@ recommendations_json() {
   ' "$file"
 }
 
+# Топ стратегий профиля в порядке сервера — только из кеша, валидного для
+# текущего провайдера. Сети нет: зовётся из прогонов, где запросы недопустимы.
+recommendations_strategies() {
+  local provider
+  provider="$(recommendations_provider)"
+  case "$provider" in ''|'Не определён'|Unknown) return 0 ;; esac
+  recommendations_valid "$RECS_FILE" "$provider" || return 0
+  awk -F'\t' -v p="$1" '$1 == "strategy" && $2 == p { print $3+0 }' "$RECS_FILE"
+}
+
 show_hint() {
   local profile label mode="classic"
   case "$1" in TCP|1) profile=1; label=YouTube ;; GV|2) profile=2; label=Googlevideo ;;

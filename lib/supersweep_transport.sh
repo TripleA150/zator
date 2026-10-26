@@ -202,20 +202,79 @@ supersweep_transport_start() {
   return 1
 }
 
+# Раннер (самолечение) и ndm-hook правят транспорт из разных процессов:
+# без взаимоисключения их -N/-D перемешиваются и бросают цепи сиротами.
+_supersweep_transport_lock() {
+  local t=0 d="${Z2R_SUPERSWEEP_DIR:-/tmp/z2r-supersweep}/probe/transport.lock" owner
+  until mkdir "$d" 2>/dev/null; do
+    # владельца убили (таймаут ndm-hook, kill) — lock с мёртвым pid снимаем,
+    # иначе все следующие reconcile/самолечения до конца прогона отказывают
+    owner="$(cat "$d/pid" 2>/dev/null)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$d"
+    else
+      sleep 1
+    fi
+    t=$((t + 1))
+    [ "$t" -lt 15 ] || return 1
+  done
+  echo "$$" > "$d/pid" 2>/dev/null || :
+}
+
+_supersweep_transport_unlock() {
+  rm -rf "${Z2R_SUPERSWEEP_DIR:-/tmp/z2r-supersweep}/probe/transport.lock" 2>/dev/null || :
+}
+
+# Наши переходы обязаны стоять ПЕРВЫМИ там, куда рабочий zapret2 (ipt: -C || -I)
+# и keenetic-policy вставляют NFQUEUE/ACCEPT: restart-fw поднимает их наверх,
+# и пробы молча уходят в рабочий nfqws2. Одним вызовом -S на всю mangle.
+_supersweep_transport_on_top() {
+  _supersweep_transport_ipt -S 2>/dev/null | awk '
+    $1 == "-A" && !($2 in first) { first[$2] = $0 }
+    END { exit !(first["POSTROUTING"] ~ / -j Z2R_SS_POST( |$)/ && first["INPUT"] ~ / -j Z2R_SS_IN( |$)/) }'
+}
+
+_supersweep_transport_intact() {
+  local hook chain
+  for hook in ${_Z2R_SS_HOOKS:-}; do
+    _supersweep_transport_hook -C "$hook" >/dev/null 2>&1 || return 1
+  done
+  for chain in Z2R_SS_POST Z2R_SS_IN; do
+    _supersweep_transport_ipt -C "$chain" -j NFQUEUE --queue-num 65535 --queue-bypass >/dev/null 2>&1 || return 1
+    _supersweep_transport_ipt -C "$chain" -j ACCEPT >/dev/null 2>&1 || return 1
+  done
+  _supersweep_transport_ipt -C Z2R_SS_RAW -j MARK --or-mark "$((_Z2R_SS_DESYNC | 0x08000000))" >/dev/null 2>&1 &&
+    _supersweep_transport_ipt -C Z2R_SS_RAW -j ACCEPT >/dev/null 2>&1 || return 1
+  _supersweep_transport_on_top
+}
+
 supersweep_transport_reinstall() {
+  local rc=0
   [ "${FWTYPE:-}" = iptables ] || return 1
   _Z2R_SS_DESYNC="${_Z2R_SS_DESYNC:-${DESYNC_MARK:-0x40000000}}"
+  _supersweep_transport_lock || { _supersweep_transport_error 'transport lock timeout'; return 1; }
+  # probe_stop убирает transport.env под этим же lock: прогон окончен, ставить нечего.
+  if [ ! -f "${Z2R_SUPERSWEEP_DIR:-/tmp/z2r-supersweep}/probe/transport.env" ]; then
+    _supersweep_transport_unlock
+    return 0
+  fi
   # В ndm-hook нет состояния родителя: восстанавливаем список своих правил.
   _Z2R_SS_HOOKS='SOCKETOUTPUT RAWOUTPUT OUTPUT INPUT PREROUTING POSTROUTING'
   _Z2R_SS_CHAINS='Z2R_SS_OUT Z2R_SS_POST Z2R_SS_PRE Z2R_SS_IN Z2R_SS_RAW'
-  supersweep_transport_stop || return 1
-  supersweep_transport_start
+  if _supersweep_transport_intact; then
+    # Второй процесс уже восстановил транспорт, пока мы ждали lock.
+    _Z2R_SS_ACTIVE=1
+  else
+    supersweep_transport_stop && supersweep_transport_start || rc=1
+  fi
+  _supersweep_transport_unlock
+  return "$rc"
 }
 
 supersweep_transport_reconcile() {
   [ "${FWTYPE:-}" = iptables ] || return 0
   _Z2R_SS_DESYNC="${DESYNC_MARK:-0x40000000}"
-  if _supersweep_transport_hook -C SOCKETOUTPUT 2>/dev/null; then
+  if _supersweep_transport_hook -C SOCKETOUTPUT 2>/dev/null && _supersweep_transport_on_top; then
     return 0
   fi
   local t=0
@@ -227,36 +286,33 @@ supersweep_transport_reconcile() {
 }
 
 supersweep_transport_check() {
-  local hook chain owned
+  local owned
   [ "${_Z2R_SS_ACTIVE:-0}" = 1 ] || return 1
   if [ "${_Z2R_SS_NFT_ACTIVE:-0}" = 1 ]; then
     owned="$(_supersweep_transport_nft_owned)" || return 1
     [ "$(printf '%s\n' "$owned" | grep -c '^delete rule ')" = "$_Z2R_SS_NFT_COUNT" ]
     return $?
   fi
-  for hook in ${_Z2R_SS_HOOKS:-}; do
-    _supersweep_transport_hook -C "$hook" >/dev/null 2>&1 || return 1
-  done
-  for chain in Z2R_SS_POST Z2R_SS_IN; do
-    _supersweep_transport_ipt -C "$chain" -j NFQUEUE --queue-num 65535 --queue-bypass >/dev/null 2>&1 || return 1
-    _supersweep_transport_ipt -C "$chain" -j ACCEPT >/dev/null 2>&1 || return 1
-  done
-  _supersweep_transport_ipt -C Z2R_SS_RAW -j MARK --or-mark "$((_Z2R_SS_DESYNC | 0x08000000))" >/dev/null 2>&1 &&
-    _supersweep_transport_ipt -C Z2R_SS_RAW -j ACCEPT >/dev/null 2>&1 || return 1
-  return 0
+  _supersweep_transport_intact
 }
 
 supersweep_transport_stop() {
   local hook chain listing chains= rc=0 hooks_live=0 remaining=
   if [ "${_Z2R_SS_NFT_ACTIVE:-0}" = 1 ]; then
     local rules
-    rules="$(_supersweep_transport_nft_owned)" || return 1
-    if [ "${_Z2R_SS_NFT_CHAIN:-0}" = 1 ] \
-      && nft list chain inet "$_Z2R_SS_NFT_TABLE" z2r_supersweep_output >/dev/null 2>&1; then
-      rules="$rules
+    if rules="$(_supersweep_transport_nft_owned)"; then
+      if [ "${_Z2R_SS_NFT_CHAIN:-0}" = 1 ] \
+        && nft list chain inet "$_Z2R_SS_NFT_TABLE" z2r_supersweep_output >/dev/null 2>&1; then
+        rules="$rules
 delete chain inet $_Z2R_SS_NFT_TABLE z2r_supersweep_output"
+      fi
+      [ -z "$rules" ] || printf '%s\n' "$rules" | nft -f - || return 1
+    else
+      # Таблицы нет (flush ruleset): наши правила и цепь исчезли вместе с ней.
+      # Сбой самого листинга — не доказательство: тогда ретрай.
+      listing="$(nft list tables 2>/dev/null)" || return 1
+      ! printf '%s\n' "$listing" | grep -qx "table inet $_Z2R_SS_NFT_TABLE" || return 1
     fi
-    [ -z "$rules" ] || printf '%s\n' "$rules" | nft -f - || return 1
     _Z2R_SS_NFT_CHAIN=0
     _Z2R_SS_NFT_ACTIVE=0
   fi

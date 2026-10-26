@@ -49,4 +49,18 @@ done
 : > "$TMP/input"
 supersweep_menu < "$TMP/input" > "$TMP/output" 2>&1
 [ ! -s "$TMP/actions" ]
+# Клиентский scope: пробы с роутера идут в default, поэтому обычный старт
+# (пробные локи в файл клиента) запрещён — только фоновый режим.
+ORCH_ACTIVE_SCOPE=mark:3
+: > "$TMP/actions"
+printf '\nB\n' > "$TMP/input"
+supersweep_menu < "$TMP/input" > "$TMP/output" 2>&1
+grep -qx background "$TMP/actions"
+! grep -qx foreground "$TMP/actions"
+grep -q 'только фоновый режим' "$TMP/output"
+: > "$TMP/actions"
+printf '\n' > "$TMP/input"
+supersweep_menu < "$TMP/input" > "$TMP/output" 2>&1
+! grep -qx foreground "$TMP/actions"
+unset ORCH_ACTIVE_SCOPE
 printf 'supersweep menu input smoke ok\n'

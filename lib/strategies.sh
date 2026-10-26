@@ -22,6 +22,82 @@ profile_strategy_restart_if_needed() {
     return 0
 }
 
+# Секунды ожидания после записи лока: locked.lua перечитывает локи только по
+# TTL кеша (2 с), без паузы проверка поймает прежнюю стратегию. Регулятор
+# общий с суперавтопрогоном (Z2R_SUPERSWEEP_SETTLE, smoke-тесты ставят 0).
+orch_lock_settle_secs() {
+    local s="${Z2R_SUPERSWEEP_SETTLE:-2}"
+    case "$s" in ''|*[!0-9]*) s=2 ;; esac
+    echo "$((10#$s))"
+}
+
+orch_lock_settle() {
+    local s
+    s="$(orch_lock_settle_secs)"
+    [ "$s" -gt 0 ] && sleep "$s"
+    return 0
+}
+
+# Предупреждения перед проверками с роутера: без nfqws2 проба уходит без
+# обхода, а трафик роутера всегда в default — лок клиента mark:N она не видит.
+orch_router_check_warn() {
+    zapret2_running || echo -e "${yellow}zapret2 не запущен — проверка покажет доступ без обхода.${plain}"
+    if [ "${ORCH_ACTIVE_SCOPE:-default}" != default ]; then
+        echo -e "${yellow}Проверка идёт с роутера, его трафик — в default: лок клиента ${ORCH_ACTIVE_SCOPE} она не видит. Проверяйте на устройстве клиента.${plain}"
+    fi
+    return 0
+}
+
+# Доменный лок перекрывает профиль (сам домен или родитель, как в рантайме):
+# проверка такого хоста покажет стратегию домена. rc=0 — лок есть (с
+# предупреждением). Проба с роутера идёт в default — смотрим default-локи.
+orch_domain_lock_warn() {
+    local d="$1" st
+    while [ -n "$d" ]; do
+        st="$(ORCH_ACTIVE_SCOPE=default orch_locked_state_get "$d" tls)"
+        case "$st" in
+            ''|auto) ;;
+            *)
+                echo -e "${yellow}У домена ${d} своя стратегия ${st} — проверка покажет её, а не стратегию профиля.${plain}"
+                return 0
+                ;;
+        esac
+        case "$d" in *.*.*) d="${d#*.}" ;; *) d="" ;; esac
+    done
+    return 1
+}
+
+# Возврат локов к значениям до подбора: kind=domain — prev_str, иначе —
+# prev_map вызывающей функции (динамическая область bash, её видит и trap).
+# auto/пусто = лока не было: убираем лок, а не пишем 0 — 0 выключал бы профиль.
+_orch_locks_restore() {
+    local kind="$1" key="$2" proto_list="$3" prev_str="${4:-}" p
+    if [ "$kind" = "domain" ]; then
+        case "$prev_str" in
+            ''|auto) orch_locked_clear "$key" "tls" ;;
+            *) orch_locked_set "$key" "tls" "$prev_str" ;;
+        esac
+        return
+    fi
+    for p in $proto_list; do
+        case "${prev_map[$p]:-}" in
+            ''|auto) orch_locked_clear "$key" "$p" ;;
+            *) orch_locked_set "$key" "$p" "${prev_map[$p]}" ;;
+        esac
+    done
+}
+
+# Отмена подбора orch_profile_try (обычная и из trap): локи — к прежним,
+# открытые на время подбора порты голоса — к прежнему NFQWS2_PORTS_UDP.
+_orch_profile_try_undo() {
+    _orch_locks_restore profile "$profile" "$proto_list"
+    if [ "$voice_trial" = "1" ]; then
+        voice_trial=0
+        config_set_var "$voice_cfg" NFQWS2_PORTS_UDP "$voice_old_ports"
+        profile_strategy_restart_notice
+    fi
+}
+
 orch_profile_try() {
     local profile="$1"
     local title="$2"
@@ -35,6 +111,7 @@ orch_profile_try() {
     local cfg=""
     local old_udp_ports=""
     local first_proto="${proto_list%% *}"
+    local auto_check=0 voice_trial=0 voice_cfg="" voice_old_ports="" host=""
     local -A prev_map
 
     max_strat="$(orch_max_strategy_for_profile "$profile")"
@@ -88,17 +165,50 @@ orch_profile_try() {
         echo "Неверный номер стратегии или вне диапазона. Начинаем с 1."
         start_strat=1
     fi
+    # 08/010 — десятичные: в арифметике ведущий 0 значит восьмеричное.
+    start_strat=$((10#$start_strat))
 
     for p in $proto_list; do
         prev_map["$p"]="$(orch_locked_state_get "$profile" "$p")"
         [ "$current_state" = "0" ] && prev_map["$p"]="0"
     done
 
+    # Ctrl+C/обрыв SSH в проверке или вопросе завершает скрипт: до выхода
+    # возвращаем прежние локи, чтобы испробованная стратегия не осталась.
+    trap '_orch_profile_try_undo; exit 130' INT HUP TERM
+
+    # Выключенный голос (6=0) убрал свои порты из NFQWS2_PORTS_UDP — без них
+    # пробуемые стратегии голосовой трафик не видят: открываем на время подбора.
+    if [ "$profile" = "6" ]; then
+        voice_cfg="$(get_config_file)"
+        voice_old_ports="$(config_get_var "$voice_cfg" NFQWS2_PORTS_UDP)"
+        config_profile_voice_ports_apply "$voice_cfg" 1
+        if profile_config_voice_ports_changed 6 "$voice_cfg" "$voice_old_ports"; then
+            voice_trial=1
+            echo "Порты голоса добавлены на время подбора."
+            profile_strategy_restart_notice
+        fi
+    fi
+
+    if [ "$profile" = "10" ] || [ -n "$test_url" ]; then
+        auto_check=1
+        orch_router_check_warn
+        case "$test_url" in
+            https://*)
+                host="$(z2r_normalize_domain "$test_url" 2>/dev/null)" || host=""
+                [ -z "$host" ] || orch_domain_lock_warn "$host" || true
+                ;;
+        esac
+    fi
+
     for ((s=start_strat; s<=max_strat; s++)); do
         for p in $proto_list; do
             orch_locked_set "$profile" "$p" "$s"
         done
         echo "Стратегия $s применена."
+        if [ "$auto_check" = "1" ]; then
+            orch_lock_settle
+        fi
         if [ "$profile" = "10" ]; then
             z2r_dns_check_print
         elif printf "%s" "$test_url" | grep -q '^http://'; then
@@ -113,13 +223,13 @@ orch_profile_try() {
             check_access "$test_url"
         fi
 
-        # Ctrl+C в read возвращает не-ноль: считаем отменой, чтобы лок
-        # испробованной стратегии не остался в locked.tsv (restore ниже по break).
+        # EOF в read — отмена (restore ниже по break); Ctrl+C ловит trap выше.
         if ! read -re -p "1 - сохранить, 0 - отмена, Enter - далее: " answer; then
             echo
             answer="0"
         fi
         if [ "$answer" = "1" ]; then
+            trap - INT HUP TERM
             cfg="$(get_config_file)"
             old_udp_ports="$(config_get_var "$cfg" NFQWS2_PORTS_UDP)"
             if profile_state_set_and_apply "$profile" "$proto_list" "$s" "$cfg"; then
@@ -127,6 +237,8 @@ orch_profile_try() {
                 profile_strategy_restart_if_needed "$profile" "$cfg" "$old_udp_ports"
             else
                 echo -e "${red}Не удалось сохранить стратегию $s для профиля $profile.${plain}"
+                # Пробный лок не оставляем: всё как до подбора.
+                _orch_profile_try_undo
             fi
             telemetry_notify
             pause_enter
@@ -136,14 +248,8 @@ orch_profile_try() {
         fi
     done
 
-    for p in $proto_list; do
-        # auto/пусто = лока не было: убираем лок (профиль возвращается
-        # к стратегии по умолчанию), а не пишем 0 — 0 выключал бы профиль.
-        case "${prev_map[$p]}" in
-            ''|auto) orch_locked_clear "$profile" "$p" ;;
-            *) orch_locked_set "$profile" "$p" "${prev_map[$p]}" ;;
-        esac
-    done
+    _orch_profile_try_undo
+    trap - INT HUP TERM
     echo "Изменения отменены."
     pause_enter
 }
@@ -166,6 +272,8 @@ orch_ask_sweep_pause() {
                 echo -e "${yellow}Неверный ввод: нужно число секунд (минимум 3).${plain}" >&2
                 ;;
             *)
+                # 08 — десятичные 8 сек: дальше пауза идёт в арифметику.
+                pause=$((10#$pause))
                 if [ "$pause" -lt 3 ]; then
                     echo -e "${yellow}Пауза не может быть меньше 3 секунд (введено ${pause}).${plain}" >&2
                 else
@@ -201,7 +309,19 @@ orch_ask_sweep_tls_pref() {
 orch_run_auto_sweep() {
     local kind="$1" key="$2" proto_list="$3" test_url="$4" start="$5" max="$6"
     local mode tls_pref pause_total
-    read -re -p "Режим: 1 - до первого успеха, 2 - полный прогон (Enter - 2, 0 - отмена): " mode
+    if ! zapret2_running; then
+        echo -e "${yellow}zapret2 не запущен — проверки бессмысленны.${plain}"
+        echo -e "Запустите zapret2 (п.2 главного меню) и повторите."
+        pause_enter
+        return 0
+    fi
+    if [ "${ORCH_ACTIVE_SCOPE:-default}" != default ]; then
+        echo -e "${yellow}Автопрогон проверяет с роутера, а трафик роутера идёт в default — лок клиента ${ORCH_ACTIVE_SCOPE} он не видит.${plain}"
+        echo -e "Подбирайте вручную, проверяя на устройстве клиента."
+        pause_enter
+        return 0
+    fi
+    read -re -p "Режим: 1 - до первого успеха (сначала рекомендованные и успешные ранее), 2 - полный прогон (Enter - 2, 0 - отмена): " mode
     if [ "$mode" = "0" ]; then
         echo "Отмена."
         pause_enter
@@ -228,6 +348,81 @@ orch_run_auto_sweep() {
     pause_enter
 }
 
+# История проб автопрогона: epoch<TAB>провайдер<TAB>профиль<TAB>стратегия<TAB>ok|warn|fail.
+# Только дописывается; привязана к провайдеру — без него не пишем и не читаем.
+orch_sweep_history_file() {
+    printf '%s\n' "${ORCH_SWEEP_HISTORY_FILE:-$ORCH_DIR/sweep_history.tsv}"
+}
+
+orch_sweep_history_provider() {
+    local provider=""
+    type recommendations_provider >/dev/null 2>&1 && provider="$(recommendations_provider)"
+    provider="$(printf '%s' "$provider" | tr -d '\t\r\n')"
+    case "$provider" in ''|'Не определён'|Unknown) return 0 ;; esac
+    printf '%s\n' "$provider"
+}
+
+# orch_sweep_history_add <профиль> <стратегия> <ok|warn|fail> — общий для
+# любых прогонов. Мусор не пишем; файл держим в пределах 3000 строк.
+orch_sweep_history_add() {
+    local p="$1" s="$2" v="$3" provider file n
+    case "$p" in ''|*[!0-9]*) return 0 ;; esac
+    case "$s" in ''|*[!0-9]*) return 0 ;; esac
+    case "$v" in ok|warn|fail) ;; *) return 0 ;; esac
+    provider="$(orch_sweep_history_provider)"
+    [ -n "$provider" ] || return 0
+    file="$(orch_sweep_history_file)"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+    printf '%s\t%s\t%d\t%d\t%s\n' "$(date +%s)" "$provider" "$((10#$p))" "$((10#$s))" "$v" >> "$file" 2>/dev/null || return 0
+    n="$(wc -l < "$file" 2>/dev/null)"
+    if [ "${n:-0}" -gt 3000 ] 2>/dev/null; then
+        tail -n 2000 "$file" > "${file}.tmp.$$" 2>/dev/null && mv -f "${file}.tmp.$$" "$file" 2>/dev/null
+        rm -f "${file}.tmp.$$" 2>/dev/null
+    fi
+    return 0
+}
+
+# orch_sweep_order <профиль> <start> <max>: полная перестановка start..max —
+# рекомендации сервера (кеш, только для текущего провайдера), затем стратегии
+# с положительным счётом локальной истории (ok +1, fail -0.5, полураспад
+# 14 дней; профили 1/2/3 — один шаблон и общая нумерация, их строки с весом
+# 0.5), затем остальные по возрастанию.
+orch_sweep_order() {
+    local p="$1" start="$2" max="$3" provider hist
+    provider="$(orch_sweep_history_provider)"
+    hist="$(orch_sweep_history_file)"
+    {
+        type recommendations_strategies >/dev/null 2>&1 && recommendations_strategies "$p"
+        if [ -n "$provider" ] && [ -s "$hist" ]; then
+            Z2R_HIST_PROVIDER="$provider" awk -F'\t' -v p="$p" -v now="$(date +%s)" '
+                BEGIN { prov=ENVIRON["Z2R_HIST_PROVIDER"]; sib[1]=1; sib[2]=1; sib[3]=1 }
+                NF == 5 && $1 ~ /^[0-9]+$/ && $2 == prov && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^(ok|warn|fail)$/ {
+                    if ($3+0 == p+0) w=1; else if (sib[p+0] && sib[$3+0]) w=0.5; else next
+                    age=now-$1; if (age < 0) age=0
+                    d=w*exp(-age*log(2)/1209600)
+                    if ($5 == "ok") sc[$4+0]+=d; else if ($5 == "fail") sc[$4+0]-=0.5*d
+                }
+                END { for (s in sc) if (sc[s] > 0) printf "%.6f %d\n", sc[s], s }
+            ' "$hist" 2>/dev/null | sort -k1,1nr -k2,2n | awk '{ print $2 }' || true
+        fi
+        awk -v a="$start" -v b="$max" 'BEGIN { for (i=a; i<=b; i++) print i }'
+    } | awk -v a="$start" -v b="$max" '
+        $1 ~ /^[0-9]+$/ && $1+0 >= a+0 && $1+0 <= b+0 && !seen[$1+0]++ { printf "%s%d", sep, $1; sep=" " }
+        END { print "" }'
+}
+
+# Одна проба цели для автопрогона: «токен|короткий текст» (ok|warn|fail).
+_orch_sweep_probe() {
+    local out v12 v13 dl res
+    out="$(z2r_tls_check_target "$1")"
+    v12="$(printf '%s\n' "$out" | sed -n 1p)"
+    v13="$(printf '%s\n' "$out" | sed -n 2p)"
+    dl="$(printf '%s\n' "$out" | sed -n 3p)"
+    res="$(z2r_tls_short_result "$v12" "$v13" "$dl" "$2")"
+    case "${res%%|*}" in ok|warn) ;; *) res="fail|${res#*|}" ;; esac
+    printf '%s\n' "$res"
+}
+
 # Автопрогон стратегий: применяет локи по очереди и проверяет каждую одним
 # прогоном движка z2r_tls_* (компактная строка на стратегию), затем сводка
 # и выбор сохранения. kind=profile|domain; key=профиль или домен.
@@ -246,11 +441,16 @@ orch_auto_sweep() {
     local prev_str="" interrupted=0 svc_was_running=0
     local -A prev_map
     local code12 code13 q12 q13 badge btxt bst bcol line12 line13
+    local order i hprof rtok confirmed="" confirmed_short="" unstable_list="" best_label
 
     # case-проверка всей строки: grep -E '^[0-9]+$' построчный и пропускает
     # многострочный мусор, у которого одна из строк — число.
     local pause_sec="${8:-${Z2R_SWEEP_PAUSE:-3}}"
     case "$pause_sec" in ''|*[!0-9]*) pause_sec=3 ;; esac
+    pause_sec=$((10#$pause_sec))
+    # Ожидание TTL кеша Lua входит в паузу: интервал = пауза + время пробы.
+    local settle psleep lock_ok
+    settle="$(orch_lock_settle_secs)"
     # Интервал из диалога не бывает < 3; технический override может быть любым.
     if [ -z "${Z2R_SWEEP_PAUSE:-}" ] && [ "$pause_sec" -lt 3 ]; then
         pause_sec=3
@@ -277,13 +477,25 @@ orch_auto_sweep() {
     fi
 
     local total=$((max - start + 1))
+    # Доменные локи — в нумерации профиля 3 (RKN): его история и рекомендации.
+    hprof="$key"
+    [ "$kind" = "domain" ] && hprof=3
+    local asc
+    asc="$(awk -v a="$start" -v b="$max" 'BEGIN { for (i=a; i<=b; i++) printf "%s%d", (i>a ? " " : ""), i }')"
+    order="$(orch_sweep_order "$hprof" "$start" "$max")"
+    [ -n "$order" ] || order="$asc"
     echo -e "${cyan}Автопрогон: стратегии ${start}-${max} (${total} шт., примерно $((total * 5 + (total - 1) * pause_sec)) сек, пауза ${pause_sec} сек между стратегиями${goal_txt}). Ctrl+C - прервать.${plain}"
+    if [ "$order" != "$asc" ]; then
+        echo -e "${cyan}Сначала рекомендованные и успешные ранее: $(printf '%s\n' "$order" | cut -d' ' -f1-5) ...${plain}"
+    fi
     # Ctrl+C не должен ронять скрипт: под set -e прерванный curl/sleep завершает
     # всю функцию раньше флага. Отключаем -e на время прогона и восстанавливаем.
     local had_e=0
     case "$-" in *e*) had_e=1 ;; esac
     set +e
     trap 'orch_auto_sweep_interrupted=1' INT
+    # Обрыв SSH/kill: последний пробный лок не должен пережить скрипт.
+    trap '_orch_locks_restore "$kind" "$key" "$proto_list" "$prev_str"; exit 130' HUP TERM
     orch_auto_sweep_interrupted=0
     # В каждой строке нужен статус обеих версий TLS — движок не должен
     # добивать медленную пробу (z2r_tls_check_target смотрит эту переменную).
@@ -291,13 +503,26 @@ orch_auto_sweep() {
     Z2R_TLS_WAIT_BOTH=1
     zapret2_running && svc_was_running=1
 
-    for ((s=start; s<=max; s++)); do
+    i=0
+    for s in $order; do
+        i=$((i + 1))
+        lock_ok=1
         if [ "$kind" = "domain" ]; then
-            orch_locked_set "$key" "tls" "$s"
+            orch_locked_set "$key" "tls" "$s" || lock_ok=0
         else
             for p in $proto_list; do
-                orch_locked_set "$key" "$p" "$s"
+                orch_locked_set "$key" "$p" "$s" || lock_ok=0
             done
+        fi
+        [ "$lock_ok" = "1" ] && [ "$settle" -gt 0 ] && sleep "$settle"
+        if [ "$orch_auto_sweep_interrupted" = "1" ]; then
+            echo -e "${yellow}Прервано пользователем на стратегии ${s}.${plain}"
+            break
+        fi
+        # Лок не записан — проверка измерила бы прежнюю стратегию.
+        if [ "$lock_ok" != "1" ]; then
+            echo -e "${red}Не удалось применить стратегию ${s}, прогон остановлен.${plain}"
+            break
         fi
 
         out="$(z2r_tls_check_target "$test_url")"
@@ -346,6 +571,7 @@ orch_auto_sweep() {
                 ;;
             *) color="$red"; disp="FAIL"; token="fail"; n_fail=$((n_fail + 1)) ;;
         esac
+        orch_sweep_history_add "$hprof" "$s" "$token"
 
         badge="$(z2r_tls_version_badge "tls1.2" "$v12")"
         btxt="${badge%%|*}"; bst="${badge#*|}"
@@ -368,21 +594,37 @@ orch_auto_sweep() {
         printf '%s %3d: %b %b %b %b\n' "$(date '+%H:%M:%S')" "$s" \
             "${color}${disp}${plain}" "$line12" "$line13" "${color}${short}${plain}"
 
+        # Зелёная бывает случайной: до остановки — повтор после той же паузы.
         if [ "$stop_on_ok" = "1" ] && [ "$token" = "ok" ]; then
-            break
+            [ "$pause_sec" -gt 0 ] && sleep "$pause_sec"
+            if [ "$orch_auto_sweep_interrupted" = "1" ]; then
+                echo -e "${yellow}Прервано пользователем на стратегии ${s}.${plain}"
+                break
+            fi
+            rtok="$(_orch_sweep_probe "$test_url" "$tls_pref")"
+            if [ "$orch_auto_sweep_interrupted" = "1" ]; then
+                echo -e "${yellow}Прервано пользователем на стратегии ${s}.${plain}"
+                break
+            fi
+            orch_sweep_history_add "$hprof" "$s" "${rtok%%|*}"
+            if [ "${rtok%%|*}" = "ok" ]; then
+                confirmed="$s"; confirmed_short="$short"
+                printf '%s %3d: %b\n' "$(date '+%H:%M:%S')" "$s" "${green}подтверждена повторной проверкой${plain}"
+                break
+            fi
+            unstable_list="${unstable_list}${unstable_list:+ }${s}"
+            printf '%s %3d: %b\n' "$(date '+%H:%M:%S')" "$s" "${yellow}НЕСТАБИЛЬНА: повтор — ${rtok#*|}${plain}"
         fi
         # Пауза между стратегиями, чтобы частыми переключениями не словить блок ТСПУ.
-        if [ "$s" -lt "$max" ] && [ "$pause_sec" -gt 0 ]; then
-            sleep "$pause_sec"
+        psleep=$((pause_sec > settle ? pause_sec - settle : 0))
+        if [ "$i" -lt "$total" ] && [ "$psleep" -gt 0 ]; then
+            sleep "$psleep"
             if [ "$orch_auto_sweep_interrupted" = "1" ]; then
                 echo -e "${yellow}Прервано пользователем на стратегии ${s}.${plain}"
                 break
             fi
         fi
     done
-    trap - INT
-    if [ "$had_e" = "1" ]; then set -e; fi
-    Z2R_TLS_WAIT_BOTH="$wait_both_prev"
 
     if [ "$svc_was_running" = "1" ] && ! zapret2_running; then
         echo -e "${red}zapret2 был остановлен: процесс nfqws2 убит (похоже, Ctrl+C). Перезапускаю...${plain}"
@@ -395,7 +637,7 @@ orch_auto_sweep() {
     fi
 
     # Лучшая = самая быстрая зелёная по скорости докачки (байт/с), а не первая
-    # попавшаяся; при равной скорости выигрывает меньший номер.
+    # попавшаяся; при равной скорости — раньше проверенная (порядок orch_sweep_order).
     best=""
     best_short=""
     if [ -n "$ok_stats" ]; then
@@ -417,6 +659,41 @@ orch_auto_sweep() {
             best_short="$(printf '%s' "$win" | cut -d'|' -f4-)"
         fi
     fi
+
+    # До первого успеха: подтверждённая зелёная важнее более быстрой нестабильной.
+    best_label="самая быстрая из зелёных"
+    if [ -n "$confirmed" ] && [ "$best" != "$confirmed" ]; then
+        best="$confirmed"; best_short="$confirmed_short"; best_label="подтверждённая повторной проверкой"
+    fi
+    # Полный прогон: лучшую зелёную один раз перепроверяем после той же паузы.
+    if [ "$stop_on_ok" != "1" ] && [ -n "$best" ] && [ "$best_from_warn" = "0" ] \
+        && [ "$orch_auto_sweep_interrupted" != "1" ] && [ "$lock_ok" = "1" ]; then
+        psleep=$((pause_sec > settle ? pause_sec - settle : 0))
+        [ "$psleep" -gt 0 ] && sleep "$psleep"
+        if [ "$kind" = "domain" ]; then
+            orch_locked_set "$key" "tls" "$best" || lock_ok=0
+        else
+            for p in $proto_list; do
+                orch_locked_set "$key" "$p" "$best" || lock_ok=0
+            done
+        fi
+        [ "$lock_ok" = "1" ] && [ "$settle" -gt 0 ] && sleep "$settle"
+        if [ "$lock_ok" = "1" ] && [ "$orch_auto_sweep_interrupted" != "1" ]; then
+            rtok="$(_orch_sweep_probe "$test_url" "$tls_pref")"
+            if [ "$orch_auto_sweep_interrupted" != "1" ]; then
+                orch_sweep_history_add "$hprof" "$best" "${rtok%%|*}"
+                if [ "${rtok%%|*}" = "ok" ]; then
+                    confirmed="$best"
+                else
+                    unstable_list="${unstable_list}${unstable_list:+ }${best}"
+                fi
+            fi
+        fi
+    fi
+    # Ctrl+C в сводке и вопросе завершает скрипт: сначала вернуть прежние локи.
+    # set -e — только в самом конце: сбой записи в сводке не должен ронять меню.
+    trap '_orch_locks_restore "$kind" "$key" "$proto_list" "$prev_str"; exit 130' INT HUP TERM
+    Z2R_TLS_WAIT_BOTH="$wait_both_prev"
 
     # Самая быстрая из «полных» (обе версии TLS + докачка) — та же метрика
     # скорости, что и у главной лучшей.
@@ -440,8 +717,14 @@ orch_auto_sweep() {
         if [ "$best_from_warn" = "1" ]; then
             echo -e " Лучшая из жёлтых (зелёных нет): ${yellow}${best}${plain} (${best_short})"
         else
-            echo -e " Лучшая (самая быстрая из зелёных): ${Fgreen}${best}${plain} (${best_short})"
+            echo -e " Лучшая (${best_label}): ${Fgreen}${best}${plain} (${best_short})"
+            if [ "$best" = "$confirmed" ]; then
+                echo -e " Стратегия ${best} подтверждена повторной проверкой."
+            elif case " $unstable_list " in *" $best "*) true ;; *) false ;; esac; then
+                echo -e " ${yellow}Лучшая ${best} не подтвердилась повторной проверкой — возможно, нестабильна.${plain}"
+            fi
         fi
+        [ -n "$unstable_list" ] && echo -e " Нестабильные (повтор не прошёл): ${yellow}${unstable_list}${plain}"
     else
         echo -e " ${red}Рабочих стратегий не найдено.${plain}"
         # YouTube весь красный — дело не в стратегиях: советуем перезагрузить
@@ -480,34 +763,27 @@ orch_auto_sweep() {
         read -re -p "0 или Enter - вернуть как было: " answer || answer="0"
     fi
 
-    if [ "$kind" = "domain" ]; then
-        if [ -n "$answer" ] && [ "$answer" != "0" ] && printf '%s' "$answer" | grep -Eq '^[0-9]+$' \
-            && [ "$answer" -ge 1 ] && [ "$answer" -le "$max" ]; then
-            orch_locked_set "$key" "tls" "$answer"
-            echo "Стратегия ${answer} сохранена для домена ${key}."
-            telemetry_notify
-        elif [ -z "$answer" ] && [ -n "$best" ]; then
-            orch_locked_set "$key" "tls" "$best"
-            echo "Стратегия ${best} сохранена для домена ${key}."
-            telemetry_notify
-        else
-            # auto/пусто = домен не имел лока: убираем лок, а не пишем 0.
-            case "$prev_str" in
-                ''|auto) orch_locked_clear "$key" "tls" ;;
-                *) orch_locked_set "$key" "tls" "$prev_str" ;;
-            esac
-            echo "Изменения отменены, прежняя стратегия домена возвращена."
-        fi
+    # Решение принято: дальше Ctrl+C — обычное завершение.
+    trap - INT HUP TERM
+    # 02 — десятичная 2: валидатор лока ведущих нулей не принимает.
+    # Не-число — отмена, как раньше (иначе [ -ge ] ругается в stderr).
+    case "$answer" in '') ;; *[!0-9]*) answer="0" ;; *) answer=$((10#$answer)) ;; esac
+    if [ -n "$answer" ] && [ "$answer" != "0" ] && [ "$answer" -ge 1 ] && [ "$answer" -le "$max" ]; then
+        :
+    elif [ -z "$answer" ] && [ -n "$best" ]; then
+        answer="$best"
     else
-        if [ -n "$answer" ] && [ "$answer" != "0" ] && printf '%s' "$answer" | grep -Eq '^[0-9]+$' \
-            && [ "$answer" -ge 1 ] && [ "$answer" -le "$max" ]; then
-            :
-        elif [ -z "$answer" ] && [ -n "$best" ]; then
-            answer="$best"
+        answer="0"
+    fi
+    if [ "$answer" != "0" ]; then
+        if [ "$kind" = "domain" ]; then
+            if orch_locked_set "$key" "tls" "$answer"; then
+                echo "Стратегия ${answer} сохранена для домена ${key}."
+            else
+                echo -e "${red}Не удалось сохранить стратегию ${answer} для домена ${key}.${plain}"
+                answer="0"
+            fi
         else
-            answer="0"
-        fi
-        if [ "$answer" != "0" ]; then
             local cfg old_udp_ports
             cfg="$(get_config_file)"
             old_udp_ports="$(config_get_var "$cfg" NFQWS2_PORTS_UDP)"
@@ -516,20 +792,21 @@ orch_auto_sweep() {
                 profile_strategy_restart_if_needed "$key" "$cfg" "$old_udp_ports"
             else
                 echo -e "${red}Не удалось сохранить стратегию ${answer} для профиля ${key}.${plain}"
+                answer="0"
             fi
-            telemetry_notify
+        fi
+        telemetry_notify
+    fi
+    # Отмена или неудачное сохранение — последний пробный лок не оставляем.
+    if [ "$answer" = "0" ]; then
+        _orch_locks_restore "$kind" "$key" "$proto_list" "$prev_str"
+        if [ "$kind" = "domain" ]; then
+            echo "Изменения отменены, прежняя стратегия домена возвращена."
         else
-            for p in $proto_list; do
-                # auto/пусто = профиль не имел лока (работала стратегия по
-                # умолчанию): убираем лок, а не пишем 0 — 0 выключал бы профиль.
-                case "${prev_map[$p]}" in
-                    ''|auto) orch_locked_clear "$key" "$p" ;;
-                    *) orch_locked_set "$key" "$p" "${prev_map[$p]}" ;;
-                esac
-            done
             echo "Изменения отменены, прежние стратегии профиля возвращены."
         fi
     fi
+    if [ "$had_e" = "1" ]; then set -e; fi
     return 0
 }
 
@@ -643,6 +920,8 @@ z2r_normalize_domain() {
     [ -z "$d" ] && return 1
     case "$d" in *[!a-z0-9.-]*) return 1 ;; esac
     case "$d" in *[a-z0-9]*) : ;; *) return 1 ;; esac
+    # Метки как в orch_scope_validate: непустые, без '-' по краям.
+    case ".$d." in *..*|*.-*|*-.*) return 1 ;; esac
     printf '%s\n' "$d"
 }
 
@@ -668,6 +947,10 @@ domain_list_prepare() {
     mkdir -p "$(dirname "$file")"
     touch "$file" 2>/dev/null || true
     sed -i '/^[[:space:]]*$/d' "$file" 2>/dev/null || true
+    # файл, отредактированный руками, без \n в конце: иначе >> склеит домены
+    if [ -s "$file" ] && [ -n "$(tail -c1 "$file" 2>/dev/null)" ]; then
+        printf '\n' >> "$file"
+    fi
 }
 
 domain_list_remove() {
@@ -685,7 +968,7 @@ domain_list_add() {
     local quiet="${5:-0}" result_var="${6:-}" result="added"
     [ -n "$domain" ] || return 1
     domain_list_prepare "$file"
-    if grep -Fixq "$domain" "$file" 2>/dev/null; then
+    if grep -Fixq -- "$domain" "$file" 2>/dev/null; then
         result="duplicate"
         [ -n "$result_var" ] && printf -v "$result_var" '%s' "$result"
         [ "$quiet" = "1" ] || echo -e "$item_name ${yellow}$domain${plain} уже есть в $label."
@@ -705,7 +988,7 @@ domain_list_add() {
 domain_list_read() {
     local file="$1" line
     domains=()
-    while IFS= read -r line; do
+    while IFS= read -r line || [ -n "$line" ]; do
         if [ -n "$line" ] && ! printf "%s" "$line" | grep -Eq '^[[:space:]]*#'; then
             domains+=("$line")
         fi
@@ -768,7 +1051,7 @@ domain_list_manage() {
                     sleep 1
                     continue
                 fi
-                target="${domains[$((choice-1))]}"
+                target="${domains[$((10#$choice-1))]}"
                 # Используем подставленную форму слова
                 echo -e "${yellow}Удалить ${item_accusative} $target?${plain}"
                 echo "1 - да, удалить"
@@ -807,8 +1090,10 @@ custom_rkn_remove_domain() {
 # при этом лок-файл не деплоился и домены в ней переживали. Печатает число
 # восстановленных доменов (0, если добавлять нечего).
 custom_rkn_restore_from_locks() {
-    local custom_file lock_file domain added=0
+    local custom_file lock_file rkn_file domain in_rkn="" added=0
+    local -a cands=() grep_args=()
     custom_file="$(custom_rkn_file)"
+    rkn_file="${ZATOR_ROOT:-/opt/zator}/extra_strats/TCP_RKN_list.txt"
     lock_file="${ORCH_LOCK_FILE:-${ORCH_DIR:-/opt/zator/extra_strats/cache/orchestra}/locked.tsv}"
     [ -f "$lock_file" ] || { printf '0\n'; return 0; }
     domain_list_prepare "$custom_file"
@@ -817,13 +1102,23 @@ custom_rkn_restore_from_locks() {
     while IFS= read -r domain; do
         [ -n "$domain" ] || continue
         grep -Fixq -- "$domain" "$custom_file" 2>/dev/null && continue
-        printf '%s\n' "$domain" >> "$custom_file"
-        added=$((added+1))
+        cands+=("$domain")
+        grep_args+=(-e "$domain")
     done <<EOF
 $(awk -F '\t' '
     NF >= 2 && $1 !~ /^mark:/ && $1 !~ /^[0-9]+$/ && $1 !~ /^[0-9.]+$/ && $1 ~ /[A-Za-z]/ {print tolower($1)}
 ' "$lock_file" | sort -u)
 EOF
+    # Строки суперавтопрогона для доменов из TCP_RKN_list.txt — не потерянные
+    # кастомные: в TCP_Custom не дублируем. Большой список — одним проходом.
+    if [ "${#cands[@]}" -gt 0 ] && [ -f "$rkn_file" ]; then
+        in_rkn="$(grep -Fix "${grep_args[@]}" "$rkn_file" 2>/dev/null || true)"
+    fi
+    for domain in "${cands[@]}"; do
+        printf '%s\n' "$in_rkn" | grep -Fixq -- "$domain" && continue
+        printf '%s\n' "$domain" >> "$custom_file"
+        added=$((added+1))
+    done
     printf '%s\n' "$added"
     return 0
 }
@@ -871,7 +1166,8 @@ manage_custom_rkn_domain() {
     fi
 
     # Нормализация: отсекаем схему (http/https), порт, путь, крайние точки и т.п.
-    if ! user_domain="$(z2r_normalize_domain "$user_domain")"; then
+    # Имя без точки (youtube вместо youtube.com) лок домена не примет.
+    if ! user_domain="$(z2r_normalize_domain "$user_domain")" || [ "${user_domain#*.}" = "$user_domain" ]; then
         echo -e "${red}Не удалось распознать домен из ввода.${plain}"
         echo -e "Укажите домен или ссылку, например: example.com или https://www.youtube.com/watch?v=..."
         pause_enter
@@ -882,7 +1178,7 @@ manage_custom_rkn_domain() {
     domain_list_prepare "$custom_file"
 
     # Проверка: существует ли уже домен и есть ли для него подобранная стратегия.
-    if grep -Fxq "$user_domain" "$custom_file" 2>/dev/null; then
+    if grep -Fxq -- "$user_domain" "$custom_file" 2>/dev/null; then
         existing_strat="$(orch_locked_get "$user_domain" "tls")"
         if printf "%s" "$existing_strat" | grep -Eq '^[0-9]+$' && [ "$existing_strat" -gt 0 ]; then
             echo -e "${yellow}Домен $user_domain уже есть в TCP_Custom, для него подобрана стратегия ${existing_strat}.${plain}"
@@ -946,6 +1242,14 @@ manage_custom_rkn_domain() {
         return 0
     fi
 
+    # При авторотации трафик ведёт circular_quality (свои локи SLM), строки
+    # locked.tsv не читаются: подбор ничего бы не проверил и не сохранил.
+    if [ "$(config_mode_text auto_mode "$(get_config_file 2>/dev/null)" 2>/dev/null)" = "включен" ]; then
+        echo -e "${yellow}Подбор стратегии для домена недоступен при авторотации (домен в TCP_Custom).${plain}"
+        pause_enter
+        return 0
+    fi
+
     # Домен попадает в лист глобально (обрабатывается у всех), а подобранная
     # стратегия закрепляется за конкретным клиентом: при включённых Client
     # scopes спрашиваем марку, остальное — как раньше (default).
@@ -1003,25 +1307,34 @@ manage_custom_rkn_domain() {
         echo "Некорректный номер стратегии или вне диапазона. Начинаем с 1."
         strategy_num=1
     fi
+    # 08/010 — десятичные: в арифметике ведущий 0 значит восьмеричное.
+    strategy_num=$((10#$strategy_num))
 
     test_url="$user_domain"
     if ! printf "%s" "$test_url" | grep -Eq '^https?://'; then
         test_url="https://$test_url"
     fi
 
+    orch_router_check_warn
+    # Ctrl+C/обрыв SSH в проверке или вопросе завершает скрипт: до выхода
+    # возвращаем прежний лок домена, пробный не должен остаться.
+    trap '_orch_locks_restore domain "$user_domain" tls "$prev_strat"; exit 130' INT HUP TERM
+
     for ((s=strategy_num; s<=max_strat; s++)); do
         orch_locked_set "$user_domain" "tls" "$s"
 
         echo -e "Стратегия $s применена для домена ${cyan}${user_domain}${plain}"
         echo -e "${yellow}Запускается проверка, пожалуйста подождите:${plain}"
+        orch_lock_settle
         check_access "$test_url"
 
-        # Ctrl+C в read возвращает не-ноль: считаем отменой (локи восстанавливаются ниже).
+        # EOF в read — отмена (лок восстанавливается ниже); Ctrl+C ловит trap выше.
         if ! read -re -p "1 - сохранить, 0 - отмена, Enter - далее: " answer; then
             echo
             answer="0"
         fi
         if [ "$answer" = "1" ]; then
+            trap - INT HUP TERM
             if [ "$ORCH_ACTIVE_SCOPE" != default ]; then
                 echo "Стратегия $s сохранена для $user_domain (клиент $ORCH_ACTIVE_SCOPE)."
             else
@@ -1035,11 +1348,8 @@ manage_custom_rkn_domain() {
         fi
     done
 
-    if printf "%s" "$prev_strat" | grep -Eq '^[0-9]+$' && [ "$prev_strat" -gt 0 ]; then
-        orch_locked_set "$user_domain" "tls" "$prev_strat"
-    else
-        orch_locked_clear "$user_domain" "tls"
-    fi
+    _orch_locks_restore domain "$user_domain" tls "$prev_strat"
+    trap - INT HUP TERM
     echo "Изменения по стратегии для домена отменены."
     pause_enter
 }
@@ -1243,7 +1553,7 @@ rkn_list_has_domain() {
 }
 
 rkn_trial_domain_pick() {
-    local ans="" add_ans=""
+    local ans="" add_ans="" is_default=0
     clear -x
     echo -e "${cyan}--- Домен проверки профиля 3 (RKN) ---${plain}"
     echo -e "Enter — ${RKN_TRIAL_DOMAIN_DEFAULT} (базовый), свой домен или ссылка"
@@ -1255,14 +1565,25 @@ rkn_trial_domain_pick() {
         return 1
     fi
     if [ -z "$ans" ]; then
-        RKN_TRIAL_DOMAIN="$RKN_TRIAL_DOMAIN_DEFAULT"
-        return 0
+        ans="$RKN_TRIAL_DOMAIN_DEFAULT"
+        is_default=1
+    else
+        ans="$(z2r_normalize_domain "$ans" 2>/dev/null)" || {
+            echo -e "${red}Не удалось распознать домен. Пример: example.com или https://site.ru/path${plain}"
+            pause_enter
+            return 1
+        }
     fi
-    ans="$(z2r_normalize_domain "$ans" 2>/dev/null)" || {
-        echo -e "${red}Не удалось распознать домен. Пример: example.com или https://site.ru/path${plain}"
+    # Лок домена перекрывает профиль 3: прогон измерил бы его, а не профиль.
+    if orch_domain_lock_warn "$ans"; then
+        echo "Выберите другой домен проверки."
         pause_enter
         return 1
-    }
+    fi
+    if [ "$is_default" = "1" ]; then
+        RKN_TRIAL_DOMAIN="$ans"
+        return 0
+    fi
     if rkn_list_has_domain "$ans"; then
         echo -e "${green}Домен ${ans} найден в РКН-списках.${plain}"
         RKN_TRIAL_DOMAIN="$ans"

@@ -9,15 +9,17 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 . "$REPO_DIR/lib/supersweep_transport.sh"
 
 # Model only the mangle table; built-in production rules must survive.
+# rules[chain|spec] = position key: -I goes above everything, -A below (-S order).
 declare -A MOCK_CHAINS=() rules=()
 log=()
+MOCK_SEQ_LO=0 MOCK_SEQ_HI=1
 iptables() {
   log+=("$*")
   if [[ ${MOCK_LOCKED:-0} == 1 ]]; then return 4; fi
   if [[ ${MOCK_FAIL_AT:-0} == "${#log[@]}" ]]; then return 1; fi
   if [[ ${MOCK_NO_WAIT:-0} == 1 && " $* " == *' -w '* ]]; then return 2; fi
   if [[ ${MOCK_BARE_WAIT:-0} == 1 && "$1" == -w && "${2:-}" == 5 ]]; then return 2; fi
-  if [[ "$1 $2 $3 $4" == '-w 5 -t mangle' ]]; then
+  if [[ "$1 $2 ${3:-} ${4:-}" == '-w 5 -t mangle' ]]; then
     shift 4
   elif [[ ${MOCK_BARE_WAIT:-0} == 1 && "$1 $2" == '-w -t' && "${3:-}" == mangle ]]; then
     shift 3
@@ -26,9 +28,19 @@ iptables() {
   else
     fail 'unexpected table or no xtables lock'
   fi
-  local op=$1 chain=${2:-} text key
+  local op=$1 chain=${2:-} text key c
   if [[ $op == -nL && -z $chain ]]; then
     for chain in "${!MOCK_CHAINS[@]}"; do printf 'Chain %s (0 references)\n' "$chain"; done
+    return 0
+  fi
+  if [[ $op == -S ]]; then
+    for c in "${!MOCK_CHAINS[@]}"; do
+      [[ -z $chain || $c == "$chain" ]] || continue
+      if [[ $c == Z2R_SS_* ]]; then printf -- '-N %s\n' "$c"; else printf -- '-P %s ACCEPT\n' "$c"; fi
+      for key in "${!rules[@]}"; do
+        if [[ $key == "$c|"* ]]; then printf '%s\t-A %s %s\n' "${rules[$key]}" "$c" "${key#*|}"; fi
+      done | sort -n | cut -f2-
+    done
     return 0
   fi
   shift 2
@@ -43,7 +55,8 @@ iptables() {
       done
       return 0 ;;
     -N) [[ ! ${MOCK_CHAINS[$chain]+yes} ]] || return 1; MOCK_CHAINS[$chain]=1 ;;
-    -A|-I) [[ ${MOCK_CHAINS[$chain]+yes} ]] || return 1; rules[$key]=1 ;;
+    -A) [[ ${MOCK_CHAINS[$chain]+yes} ]] || return 1; rules[$key]=$((++MOCK_SEQ_HI)) ;;
+    -I) [[ ${MOCK_CHAINS[$chain]+yes} ]] || return 1; rules[$key]=$((--MOCK_SEQ_LO)) ;;
     -D) [[ ${rules[$key]+yes} ]] || return 1; unset 'rules[$key]' ;;
     -C) [[ ${rules[$key]+yes} ]] ;;
     -F) [[ $chain == Z2R_SS_* ]] || fail 'production flush'; for key in "${!rules[@]}"; do [[ $key != "$chain|"* ]] || unset 'rules[$key]'; done ;;
@@ -170,12 +183,20 @@ nft() {
   if [ "$1" = -f ]; then
     cat > "$TMP_DIR/nft.batch"
   elif [ "$1" = -a ]; then
+    [ "${NFT_NO_TABLE:-0}" != 1 ] || return 1
     if [ "${NFT_TAGGED:-0}" = 1 ]; then
       printf 'table inet zapret2 {\n chain postnat_hook {\n'
       for ((h=42; h<53; h++)); do printf 'meta mark 1 comment "z2r_supersweep" # handle %s\n' "$h"; done
       printf ' }\n}\n'
     fi
   else
+    if [ "$*" = 'list tables' ]; then
+      [ "${NFT_TABLES_FAIL:-0}" != 1 ] || return 1
+      [ "${NFT_NO_TABLE:-0}" = 1 ] || printf 'table inet zapret2\n'
+      printf 'table inet fw4\n'
+      return 0
+    fi
+    [ "${NFT_NO_TABLE:-0}" != 1 ] || return 1
     if [ "$*" = 'list chain inet zapret2 z2r_supersweep_output' ]; then
       [ "${NFT_TAGGED:-0}" = 1 ] || return 1
     fi
@@ -199,8 +220,26 @@ NFT_TAGGED=1
 supersweep_transport_stop || fail 'native nft stop'
 grep -q '^delete rule inet zapret2 postnat_hook handle 42$' "$TMP_DIR/nft.batch" || fail 'cleanup must delete exact owned handles'
 grep -q '^delete chain inet zapret2 z2r_supersweep_output$' "$TMP_DIR/nft.batch" || fail 'owned output chain leaked'
+# flush ruleset removed the zapret2 table with our rules: stop must not wedge
+# forever (the lock and probe nfqws2 would be kept).
+NFT_TAGGED=0
+supersweep_transport_start || fail 'nft restart for table loss'
+NFT_NO_TABLE=1
+rm -f "$TMP_DIR/nft.batch"
+# A failed table listing is not proof that the table is gone.
+NFT_TABLES_FAIL=1
+! supersweep_transport_stop || fail 'nft stop accepted a failed table listing'
+[[ $_Z2R_SS_NFT_ACTIVE == 1 ]] || fail 'nft forgot live rules after a failed listing'
+NFT_TABLES_FAIL=0
+supersweep_transport_stop || fail 'nft stop must succeed once the table is gone'
+[[ ! -e "$TMP_DIR/nft.batch" && $_Z2R_SS_NFT_ACTIVE == 0 && $_Z2R_SS_ACTIVE == 0 ]] || fail 'nft state survived table loss'
+NFT_NO_TABLE=0
 
 # ndm-style external wipe: reconcile must reclaim stale chains and rebuild.
+# Reinstall needs a live run (transport.env) and serializes on its lock dir.
+export Z2R_SUPERSWEEP_DIR="$TMP_DIR/run"
+mkdir -p "$Z2R_SUPERSWEEP_DIR/probe"
+: > "$Z2R_SUPERSWEEP_DIR/probe/transport.env"
 FWTYPE=iptables
 unset _Z2R_SS_IPT_WAIT _Z2R_SS_IPT_WAIT_DONE
 log=()
@@ -225,7 +264,46 @@ before=${#log[@]}
 DESYNC_MARK=0x40000000
 supersweep_transport_reconcile || fail 'reconcile noop'
 [[ ${#log[@]} -le $((before + 1)) ]] || fail 'reconcile touched live rules'
+
+# restart-fw / keenetic-policy re-insert production rules above live probe
+# hooks: -C still passes, so check and reconcile must look at the order.
+supersweep_transport_check || fail 'order setup check'
+rules['POSTROUTING|-j PRODUCTION']=$((--MOCK_SEQ_LO))
+! supersweep_transport_check || fail 'production POSTROUTING rule above probe hook not detected'
+supersweep_transport_reconcile || fail 'reconcile order'
+supersweep_transport_check || fail 'reconcile did not put probe hooks back on top'
+rules['INPUT|-j PRODUCTION']=$((--MOCK_SEQ_LO))
+! supersweep_transport_check || fail 'production INPUT queue above probe hook not detected'
+supersweep_transport_reinstall || fail 'reinstall order'
+supersweep_transport_check || fail 'reinstall did not restore order'
+# The other process already restored it while we waited: reinstall is a no-op.
+before=${#log[@]}
+supersweep_transport_reinstall || fail 'reinstall intact'
+for entry in "${log[@]:before}"; do
+  [[ " $entry " != *' -N '* && " $entry " != *' -D '* ]] || fail 'reinstall rebuilt an intact transport'
+done
+# Runner and ndm hook at once: a held lock is never bypassed.
+mkdir "$Z2R_SUPERSWEEP_DIR/probe/transport.lock"
+sleep() { :; }
+before=${#log[@]}
+! supersweep_transport_reinstall 2>/dev/null || fail 'reinstall ignored a held transport lock'
+unset -f sleep
+[[ ${#log[@]} == "$before" && -d "$Z2R_SUPERSWEEP_DIR/probe/transport.lock" ]] || fail 'held transport lock was not respected'
+rmdir "$Z2R_SUPERSWEEP_DIR/probe/transport.lock"
+# Holder killed mid-reinstall: a lock with a dead pid is reclaimed, not waited out.
+mkdir "$Z2R_SUPERSWEEP_DIR/probe/transport.lock"
+( exit 0 ) & dead_pid=$!; wait "$dead_pid"
+echo "$dead_pid" > "$Z2R_SUPERSWEEP_DIR/probe/transport.lock/pid"
+supersweep_transport_reinstall || fail 'stale transport lock was not reclaimed'
+[[ ! -e "$Z2R_SUPERSWEEP_DIR/probe/transport.lock" ]] || fail 'reclaimed transport lock left behind'
+# probe_stop removed transport.env: the run is over, a late hook installs nothing.
+rm -f "$Z2R_SUPERSWEEP_DIR/probe/transport.env"
+before=${#log[@]}
+supersweep_transport_reinstall || fail 'reinstall after run end'
+[[ ${#log[@]} == "$before" && ! -e "$Z2R_SUPERSWEEP_DIR/probe/transport.lock" ]] || fail 'reinstall touched firewall after run end'
+: > "$Z2R_SUPERSWEEP_DIR/probe/transport.env"
 supersweep_transport_stop || fail 'reconcile noop stop'
+[[ ${#MOCK_CHAINS[@]} == 4 && ${#rules[@]} == 4 ]] || fail 'order checks leaked rules'
 unset DESYNC_MARK
 
 # Keenetic Entware iptables 1.4.21: -w exists only as a bare flag; -w 5 gives

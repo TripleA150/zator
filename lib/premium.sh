@@ -122,13 +122,16 @@ zefeer_space_999() {
 
   matrix_999_sleep() {
     if command -v usleep >/dev/null 2>&1; then
-      usleep 30000
+      # Ctrl+C убивает usleep (rc=130): под set -e это уронило бы z2r.sh.
+      usleep 30000 || true
     else
       read -rsn1 -t 0.03 key 2>/dev/null || true
     fi
   }
 
-  trap 'matrix_999_cleanup; trap - INT TERM; return 0' INT TERM
+  # return в trap выходит лишь из matrix_999_sleep: останавливаемся по флагу.
+  local z2r_matrix_stop=""
+  trap 'z2r_matrix_stop=1' INT TERM
 
   clear
   tput civis 2>/dev/null || true
@@ -141,6 +144,7 @@ zefeer_space_999() {
 
   frames=360
   for (( frame = 0; frame < frames; frame++ )); do
+    [ -n "$z2r_matrix_stop" ] && break
     buf=""
     for (( x = 1; x <= cols; x += 2 )); do
       (( frame % speeds[$x] == 0 )) || continue

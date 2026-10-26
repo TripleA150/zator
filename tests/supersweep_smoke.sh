@@ -28,6 +28,7 @@ cat > "$TMP_DIR/bin/curl" <<'MOCK'
 url=""
 hdr=""
 head=0
+ver=""
 prev=""
 for arg in "$@"; do
   [ "$prev" = "-D" ] && hdr="$arg"
@@ -65,6 +66,20 @@ if [ -n "$strat" ]; then
     *" $strat "*) green=1 ;;
   esac
 fi
+# flaky mode (MOCK_FLAKY_P<prof>): green only on the first probe of the
+# strategy; separate counters for each HEAD version and the download
+if [ "$green" = 1 ] && [ -n "$prof" ]; then
+  eval "flaky=\${MOCK_FLAKY_P${prof}:-}"
+  case " $flaky " in
+    *" $strat "*)
+      k=dl; [ "$head" = 1 ] && k="h$ver"
+      cf="$TMPDIR/flaky.$prof.$strat.$k"
+      n=0; [ -f "$cf" ] && n="$(cat "$cf")"
+      n=$((n + 1)); echo "$n" > "$cf"
+      [ "$n" -gt 1 ] && green=0
+      ;;
+  esac
+fi
 # partial mode: tls 1.2 times out, tls 1.3 answers -> engine sees WARN
 half=0
 if [ -z "$prof" ] && [ -n "$tag" ]; then
@@ -86,6 +101,11 @@ if [ "$head" = 1 ]; then
 fi
 if [ "$green" = 1 ]; then
   t="$(awk -v s="${strat:-0}" 'BEGIN{printf "%.3f", 2.6 - 0.1 * s}')"
+  # MOCK_FAST_P<prof>: the fastest download, regardless of number
+  if [ -n "$prof" ]; then
+    eval "fast=\${MOCK_FAST_P${prof}:-}"
+    case " $fast " in *" $strat "*) t=0.100 ;; esac
+  fi
   echo "206 65536 $t"
   exit 0
 fi
@@ -270,14 +290,23 @@ grep -q 'медуза\|meduza.io' <<<"$out" || fail "сценарий 1: в от
 grep -q 'Зелёные\|Рабочие' <<<"$out" || fail "сценарий 1: в отчёте нет списков рабочих стратегий"
 # pacing-файл: фактические паузы воркеров. Пауза 0 + ускоритель выключен
 # (GREEN_PAUSE=0 = обычная пауза) -> все нули; yt пишет по строке на каждую
-# стратегию, кроме последней
+# стратегию, кроме последней; паузы перепроверки помечены confirm в 4-й колонке
 [ -f "$Z2R_SUPERSWEEP_DIR/pacing.tsv" ] || fail "сценарий 1: нет pacing.tsv"
-[ "$(awk -F'\t' '$1=="yt"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 4 ] \
+[ "$(awk -F'\t' '$1=="yt" && $4==""' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 4 ] \
   || fail "сценарий 1: yt-воркер должен записать 4 паузы (все стратегии, кроме последней)"
+# перепроверка: зелёные 2 и 4 ещё по 2 раза (вперемешку), паузы перед каждой
+[ "$(wc -l < "$Z2R_SUPERSWEEP_DIR/confirm.yt.tsv")" = 4 ] || fail "сценарий 1: confirm.yt.tsv = 2 кандидата x 2 раунда"
+[ "$(awk -F'\t' '$1=="yt" && $4=="confirm"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 4 ] \
+  || fail "сценарий 1: перед каждой пробой перепроверки yt — пауза"
+grep -q '^stable=1$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 1: стабильный победитель yt без stable=1"
+grep -q '^confirm=4:3/3,2:3/3$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 1: confirm= в best.yt: $(grep '^confirm=' "$Z2R_SUPERSWEEP_DIR/best.yt")"
+grep -q '^n_ok=2$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 1: n_ok обязан считать только основной проход"
 [ "$(awk -F'\t' '$1=="yt" && $3!="0"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 0 ] \
   || fail "сценарий 1: при паузе 0 и выключенном ускорителе все паузы должны быть 0"
-[ "$(awk -F'\t' '$1=="rkn"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 15 ] \
-  || fail "сценарий 1: rkn-воркер должен записать 15 пауз (5 стратегий x 3 домена)"
+# РКН: одна пауза на промежуток между пробами (и на смене домена), после
+# последней пробы прогона паузы нет: 5 стратегий x 3 домена - 1
+[ "$(awk -F'\t' '$1=="rkn"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 14 ] \
+  || fail "сценарий 1: rkn-воркер должен записать 14 пауз (5 x 3 проб, кроме последней)"
 # зелёные есть — совета перезагрузки быть не должно
 if grep -q 'ПЕРЕЗАГРУЗИТЬ РОУТЕР' <<<"$out"; then
   fail "сценарий 1: совет перезагрузки появился при зелёных стратегиях"
@@ -695,5 +724,145 @@ grep -q 'rutracker.org' "$TMP_DIR/gate13.args" \
 [ "$(awk -F'\t' '$1=="yt" && $2=="2" {print $3}' "$Z2R_SUPERSWEEP_DIR/pacing.tsv")" = "3" ] \
   || fail "сценарий 13: красная стратегия должна дать паузу 5с минус выдержка 2с = 3с"
 unset MOCK_DELAY MOCK_OK_P1
+
+# == 14. оборванные воркеры (не отмена): частичный результат не применяется ==
+# Сбой движка на 3-й пробе YouTube и на 2-й пробе второго домена РКН: прогон
+# доходит до конца, но ни частичный лучший профиля 1, ни победитель неполной
+# карты РКН (раньше считалась полной по числу стратегий) не применяются.
+
+: > "$ORCH_LOCK_FILE"
+orch_locked_set 1 tls 3
+orch_locked_set 3 tls 4
+rm -rf "$Z2R_SUPERSWEEP_DIR"
+rm -f "$TMP_DIR"/calls.*
+export MOCK_OK_P1="2 4" MOCK_OK_P2="3" MOCK_OK_P4="1 5"
+export MOCK_OK_meduza_io="1 2" MOCK_OK_chess_com="2"
+eval "orig_$(declare -f z2r_tls_check_target)"
+z2r_tls_check_target() {
+  local host="${1#https://}" n=0 limit=0
+  host="${host%%/*}"
+  case "$host" in www.youtube.com) limit=3 ;; chess.com) limit=2 ;; esac
+  if [ "$limit" -gt 0 ]; then
+    if [ -f "$TMP_DIR/calls.$host" ]; then n="$(cat "$TMP_DIR/calls.$host")"; fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$TMP_DIR/calls.$host"
+    [ "$n" -lt "$limit" ] || return 1
+  fi
+  orig_z2r_tls_check_target "$@"
+}
+rc14=0
+out14="$(supersweep_run both 0 0 0 1 meduza.io chess.com </dev/null 2>&1)" || rc14=$?
+eval "$(declare -f orig_z2r_tls_check_target | sed '1s/^orig_//')"
+unset -f orig_z2r_tls_check_target
+[ "$rc14" = 0 ] || { printf '%s\n' "$out14" >&2; fail "сценарий 14: прогон без отмены должен вернуть 0, вернул $rc14"; }
+grep -q '^interrupted=1$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 14: неполный проход yt должен быть interrupted=1"
+grep -q '^best=2$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 14: частичный кандидат yt должен быть 2"
+[ "$(lock_state 1 tls)" = 3 ] || fail "сценарий 14: частичный лучший yt применён ($(lock_state 1 tls)), прежний 3"
+grep -q 'проход профиля неполный' <<<"$out14" || fail "сценарий 14: нет сообщения о неполном проходе профиля"
+[ "$(wc -l < "$Z2R_SUPERSWEEP_DIR/coverage.tsv")" = 6 ] || fail "сценарий 14: ожидалось 6 из 10 пар карты"
+grep -q '^interrupted=1$' "$Z2R_SUPERSWEEP_DIR/best.rkn" || fail "сценарий 14: неполная карта РКН помечена полной"
+[ "$(lock_state 3 tls)" = 4 ] || fail "сценарий 14: победитель неполной карты применён к профилю 3 ($(lock_state 3 tls)), прежний 4"
+[ "$(lock_state meduza.io tls)" = auto ] || fail "сценарий 14: доменные пробы неполной карты должны откатиться"
+grep -q 'карта покрытий неполная' <<<"$out14" || fail "сценарий 14: нет сообщения о неполной карте"
+
+# == 15. закрытый терминал (SIGHUP) = Ctrl+C: пробные локи откатываются ==
+# Раньше HUP делал exit 129 мимо отката: профиль оставался на пробной стратегии.
+# Если HUP игнорируется с входа (nohup), trap невозможен — сценарий пропускаем.
+if [ -z "$(trap -p HUP)" ]; then
+  : > "$ORCH_LOCK_FILE"
+  orch_locked_set 1 tls 3
+  rm -rf "$Z2R_SUPERSWEEP_DIR"
+  export MOCK_DELAY=0.2 MOCK_OK_P1="2 4"
+  supersweep_run both 0 0 0 1 meduza.io >"$TMP_DIR/hup.log" 2>&1 &
+  HUP_PID=$!
+  n=0
+  while [ "$n" -lt 200 ]; do
+    [ -s "$Z2R_SUPERSWEEP_DIR/progress.yt.tsv" ] && break
+    sleep 0.1 2>/dev/null || sleep 1
+    n=$((n + 1))
+  done
+  [ -s "$Z2R_SUPERSWEEP_DIR/progress.yt.tsv" ] || fail "сценарий 15: прогон не начал писать progress"
+  kill -HUP "$(cat "$Z2R_SUPERSWEEP_DIR.lock/pid")"
+  rc15=0
+  wait "$HUP_PID" || rc15=$?
+  [ "$rc15" = 1 ] || fail "сценарий 15: прогон после HUP должен вернуть 1 (откат), вернул $rc15"
+  [ "$(lock_state 1 tls)" = 3 ] || fail "сценарий 15: после HUP профиль 1 остался на пробной стратегии $(lock_state 1 tls)"
+  [ "$(lock_state 1 http)" = auto ] || fail "сценарий 15: после HUP профиль 1/http не откатился ($(lock_state 1 http))"
+  grep -q 'Прервано пользователем' "$TMP_DIR/hup.log" || fail "сценарий 15: HUP не прошёл путём отмены с откатом"
+  unset MOCK_DELAY MOCK_OK_P1
+fi
+
+# == 16. дефолт РКН: равенство покрытия решают обе TLS и зелёные YouTube/GV ==
+# Без сети: только ранжирование. Колонки вывода прежние (5 / 3).
+
+U16="$TMP_DIR/u16"
+mkdir -p "$U16"
+: > "$U16/cov.tsv"
+for d in a.ru b.ru c.ru; do
+  printf '1\t%s\t3\tok\t65536\t100\n1\t%s\t5\tok\t65536\t300\n' "$d" "$d" >> "$U16/cov.tsv"
+done
+printf '1\t1\t3\tok\tok\tok\t65536\t1\tx\n1\t1\t5\tfail\ttimeout\ttimeout\t-\t-\tx\n' > "$U16/yt.tsv"
+printf '1\t2\t3\tok\tok\tok\t65536\t1\tx\n1\t2\t5\tfail\ttimeout\ttimeout\t-\t-\tx\n' > "$U16/gv.tsv"
+[ "$(_supersweep_rkn_winners 3 "$U16/cov.tsv" | cut -f1)" = 5 ] \
+  || fail "сценарий 16: без доп. файлов — прежний порядок (сумма скоростей), ждали 5"
+[ "$(_supersweep_rkn_winners 3 "$U16/cov.tsv" "$U16/nope.tsv" "$U16/yt.tsv" "$U16/gv.tsv" | cut -f1)" = 3 ] \
+  || fail "сценарий 16: при равном покрытии зелёные YouTube/GV важнее скорости, ждали 3"
+[ "$(_supersweep_rkn_winners 3 "$U16/cov.tsv" "$U16/nope.tsv" "$U16/yt.tsv" "$U16/gv.tsv" | awk -F'\t' '{print NF}')" = 5 ] \
+  || fail "сценарий 16: формат вывода _supersweep_rkn_winners изменился"
+: > "$U16/pr.tsv"
+for d in a.ru b.ru c.ru; do
+  printf '1\t%s\t5\tok\tok\tok\t65536\t1\tx\n1\t%s\t3\tok\ttimeout\tok\t65536\t1\tx\n' "$d" "$d" >> "$U16/pr.tsv"
+done
+[ "$(_supersweep_rkn_winners 3 "$U16/cov.tsv" "$U16/pr.tsv" "$U16/yt.tsv" "$U16/gv.tsv" | cut -f1)" = 5 ] \
+  || fail "сценарий 16: обе TLS на доменах важнее зелёных YouTube/GV, ждали 5"
+printf '1\ta.ru\t3\tok\t65536\t100\n1\ta.ru\t5\tok\t65536\t100\n' > "$U16/dcov.tsv"
+[ "$(_supersweep_rkn_domain_winners "$U16/dcov.tsv" | cut -f2)" = 3 ] \
+  || fail "сценарий 16: домен без progress — меньший номер при равной скорости"
+[ "$(_supersweep_rkn_domain_winners "$U16/dcov.tsv" "$U16/pr.tsv")" = $'a.ru\t5\t0' ] \
+  || fail "сценарий 16: домен — обе TLS выигрывают равную скорость, ждали 5"
+
+# == 17. перепроверка лучших зелёных перед применением ==
+# 2 — самая быстрая, но зелёная только на первой пробе; 4 — стабильная.
+
+run17() {
+  : > "$ORCH_LOCK_FILE"
+  rm -rf "$Z2R_SUPERSWEEP_DIR"
+  rm -f "$TMP_DIR"/flaky.*
+  # без зазора между пробами TLS 1.2/1.3 (1 с по умолчанию): три прогона подряд
+  out17="$(Z2R_SUPERSWEEP_PROBE_GAP=0 supersweep_run both 0 0 0 1 meduza.io </dev/null 2>&1)" || { printf '%s\n' "$out17" >&2; fail "сценарий 17: прогон упал"; }
+}
+export MOCK_OK_P1="2 4" MOCK_OK_P2="3" MOCK_OK_P4="1" MOCK_OK_meduza_io="1"
+export MOCK_FAST_P1="2" MOCK_FLAKY_P1="2"
+run17
+[ "$(lock_state 1 tls)" = 4 ] || fail "сценарий 17: применена нестабильная быстрая $(lock_state 1 tls), ждали стабильную 4"
+grep -q $'profile\t1\t4' "$Z2R_SUPERSWEEP_DIR/applied.tsv" || fail "сценарий 17: applied.tsv без profile 1 -> 4"
+grep -q '^best=4$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 17: best.yt должен быть 4"
+grep -q '^stable=1$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 17: best.yt без stable=1"
+grep -q '^best_short=подтверждена 3/3' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 17: best_short без «подтверждена 3/3»"
+[ "$(wc -l < "$Z2R_SUPERSWEEP_DIR/confirm.yt.tsv")" = 4 ] || fail "сценарий 17: confirm.yt.tsv = min(K, зелёных) x R = 4"
+[ "$(awk -F'\t' '$3==2 && $4=="ok"' "$Z2R_SUPERSWEEP_DIR/confirm.yt.tsv" | wc -l)" = 0 ] \
+  || fail "сценарий 17: нестабильная 2 не должна зеленеть в перепроверке"
+[ "$(wc -l < "$Z2R_SUPERSWEEP_DIR/progress.yt.tsv")" = 5 ] || fail "сценарий 17: progress.yt.tsv обязан хранить ровно max строк"
+# одна зелёная (gv) тоже перепроверяется; профили 1/2/4 по K лучших
+[ "$(wc -l < "$Z2R_SUPERSWEEP_DIR/confirm.gv.tsv")" = 2 ] || fail "сценарий 17: confirm.gv.tsv = 1 x 2"
+# РКН не перепроверяется: число проб прежнее
+[ ! -e "$Z2R_SUPERSWEEP_DIR/confirm.rkn.tsv" ] || fail "сценарий 17: РКН не должен перепроверяться"
+grep -q 'Повторная проверка лучших зелёных' <<<"$out17" || fail "сценарий 17: нет строки перепроверки"
+
+# CONFIRM_TOP=0: прежнее поведение — самая быстрая из одного замера
+Z2R_SUPERSWEEP_CONFIRM_TOP=0 run17
+[ "$(lock_state 1 tls)" = 2 ] || fail "сценарий 17: CONFIRM_TOP=0 должен применить быструю 2, а не $(lock_state 1 tls)"
+[ ! -e "$Z2R_SUPERSWEEP_DIR/confirm.yt.tsv" ] || fail "сценарий 17: CONFIRM_TOP=0 не должен перепроверять"
+grep -q '^stable=' "$Z2R_SUPERSWEEP_DIR/best.yt" && fail "сценарий 17: CONFIRM_TOP=0 — best.yt без новых ключей"
+[ "$(awk -F'\t' '$1=="yt"' "$Z2R_SUPERSWEEP_DIR/pacing.tsv" | wc -l)" = 4 ] \
+  || fail "сценарий 17: CONFIRM_TOP=0 — паузы как раньше (4)"
+
+# все зелёные нестабильны: победитель всё равно применяется (не реже прежнего), stable=0
+export MOCK_FLAKY_P1="2 4"
+run17
+[ "$(lock_state 1 tls)" = 2 ] || fail "сценарий 17: нестабильный победитель должен применяться (2), а не $(lock_state 1 tls)"
+grep -q '^stable=0$' "$Z2R_SUPERSWEEP_DIR/best.yt" || fail "сценарий 17: нестабильный победитель без stable=0"
+grep -q 'нестабильна (1/3)' <<<"$out17" || fail "сценарий 17: нет жёлтой строки о нестабильности"
+unset MOCK_FAST_P1 MOCK_FLAKY_P1
 
 echo "supersweep smoke ok"
