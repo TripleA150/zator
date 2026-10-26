@@ -262,11 +262,16 @@ if [ -n "$zapret2_archive" ]; then
   [ -f "$zapret2_archive" ] || fail "не найден $zapret2_archive"
   version="$(archive_version "$zapret2_archive")" || \
     fail "ожидалось имя zapret2-vVERSION.tar.gz"
+  # strip_windows_binaries пересобирает архив на месте: исходник пользователя не трогаем
+  cp -f "$zapret2_archive" "$download_dir/" || fail "не удалось скопировать $zapret2_archive"
+  zapret2_archive="$download_dir/$(basename -- "$zapret2_archive")"
 fi
 if [ -n "$openwrt_archive" ]; then
   [ -f "$openwrt_archive" ] || fail "не найден $openwrt_archive"
   openwrt_version="$(openwrt_archive_version "$openwrt_archive")" || \
     fail "ожидалось имя zapret2-vVERSION-openwrt-embedded.tar.gz"
+  cp -f "$openwrt_archive" "$download_dir/" || fail "не удалось скопировать $openwrt_archive"
+  openwrt_archive="$download_dir/$(basename -- "$openwrt_archive")"
   [ -z "$version" ] || [ "$openwrt_version" = "$version" ] || \
     fail "версии локальных архивов zapret2 не совпадают: $version и $openwrt_version"
   [ -n "$version" ] || version="$openwrt_version"

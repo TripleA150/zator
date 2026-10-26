@@ -113,11 +113,14 @@ nfqws2_state()
 		fi
 		return
 	fi
-	# pidfile мог потеряться — ищем процесс по имени
-	byname=$(pidof nfqws2 2>/dev/null)
-	if [ -n "$byname" ]; then
-		echo "run $byname"
-		return
+	# pidfile мог потеряться — ищем процесс по имени. Мёртвый pidfile = падение:
+	# живой чужой nfqws2 (проба суперсвипа, blockcheck2) не должен его маскировать
+	if [ -z "$dead_pf" ]; then
+		byname=$(pidof nfqws2 2>/dev/null)
+		if [ -n "$byname" ]; then
+			echo "run $byname"
+			return
+		fi
 	fi
 	# процесса нет: pidfile остался = упал, pidfile удалён = штатная остановка
 	if [ -n "$dead_pf" ]; then

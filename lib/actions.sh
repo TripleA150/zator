@@ -35,29 +35,36 @@ get_keenetic_policy_status() {
   [ -n "$name" ] && echo "$name | $(get_keenetic_policy_mode_label)" || echo "Не задана"
 }
 
+# Ошибки ввода/рестарта возвращают 0: подменю зовёт эти действия без || true,
+# а под set -e z2r.sh return 1 выбрасывает пользователя из меню в shell.
 menu_action_set_keenetic_policy_name() {
   local name mark=""
-  ensure_keenetic_policy_config || return 1
+  ensure_keenetic_policy_config || { echo -e "${red}Не найден /opt/zapret2/config.${plain}"; return 0; }
   read -re -p "Введите имя Keenetic-политики. Enter очистит настройку, 0 - отмена: " name
   [ "$name" = "0" ] && { echo "Изменение отменено."; return; }
-  case "$name" in *$'\n'*|*'|'*) echo -e "${red}Недопустимое имя политики.${plain}"; return 1;; esac
+  # Значение пишется в config без кавычек, а init source-ит его от root:
+  # пробел запустил бы второе слово как команду.
+  case "$name" in
+    *$'\n'*|*'|'*|*[[:space:]\#\'\"\`\$\;\&\(\)\<\>\\]*)
+      echo -e "${red}Недопустимое имя политики (пробелы/спецсимволы). Укажите системное имя PolicyN.${plain}"; return 0;;
+  esac
   if [ -n "$name" ]; then
     mark="$(keenetic_policy_get_mark "$name")"
-    [ -n "$mark" ] || { echo -e "${red}Политика '$name' не найдена.${plain}"; return 1; }
+    [ -n "$mark" ] || { echo -e "${red}Политика '$name' не найдена.${plain}"; return 0; }
   fi
-  config_set_var /opt/zapret2/config POLICY_NAME "$name"
-  config_set_var /opt/zapret2/config POLICY_MARK "$mark"
-  z2r_service_action restart
+  config_set_var /opt/zapret2/config POLICY_NAME "$name" || return 0
+  config_set_var /opt/zapret2/config POLICY_MARK "$mark" || return 0
+  z2r_service_action restart || true
   [ -n "$name" ] && echo -e "${green}Установлена Keenetic-политика:${plain} $name" || echo -e "${yellow}Ограничение по Keenetic-политике отключено.${plain}"
 }
 
 menu_action_toggle_keenetic_policy_mode() {
   local next value
-  ensure_keenetic_policy_config || return 1
+  ensure_keenetic_policy_config || { echo -e "${red}Не найден /opt/zapret2/config.${plain}"; return 0; }
   value="$(sed -n 's/^POLICY_EXCLUDE=//p' /opt/zapret2/config | tail -n1)"
   [ "$value" = "1" ] && { next=0; value="Только устройства из политики"; } || { next=1; value="Все, кроме устройств из политики"; }
   sed -i "s/^POLICY_EXCLUDE=.*/POLICY_EXCLUDE=$next/" /opt/zapret2/config
-  z2r_service_action restart
+  z2r_service_action restart || true
   echo -e "${green}Режим Keenetic-политики изменён:${plain} $value"
 }
 
@@ -67,7 +74,7 @@ menu_action_toggle_keenetic_policy_mode() {
 # остановлен, старт/рестарт — забота вызывающего.
 config_apply_from_default() {
   local root="${ZAPRET2_ROOT:-/opt/zapret2}"
-  local old_scope_cfg="/tmp/z2r_client_scope_config_$$"
+  local old_scope_cfg="/tmp/z2r_client_scope_config_$$" v
   cp -f "$root/config" "$old_scope_cfg" 2>/dev/null || true
 
   # Раскомменчивание юзера под keenetic или merlin
@@ -83,6 +90,12 @@ config_apply_from_default() {
   if [ -f "$old_scope_cfg" ]; then
     config_client_scope_apply "$old_scope_cfg" "$root/config" || true
     [ "${hardware:-}" = "keenetic" ] && { config_keenetic_policy_apply "$old_scope_cfg" "$root/config" || true; }
+    # FWTYPE — свойство платформы (payload config.default из релиза несёт
+    # iptables, на nft-only OpenWRT/VPS это снимает правила), FLOWOFFLOAD — железа.
+    for v in FWTYPE FLOWOFFLOAD; do
+      config_var_exists "$old_scope_cfg" "$v" || continue
+      config_set_var "$root/config" "$v" "$(config_get_var "$old_scope_cfg" "$v")" || true
+    done
     rm -f "$old_scope_cfg"
   fi
   config_client_scope_ensure "$root/config" || true
@@ -97,30 +110,50 @@ config_apply_from_default() {
 
 menu_action_update_config_reset() {
   local old_scope_cfg="/tmp/z2r_client_scope_config_$$"
+  # Сброс транзакционный: листы, локи и фейки сначала уезжают в stash (тот же
+  # раздел /opt — mv дешёвый) и возвращаются на место, если get_repo упадёт.
+  local stash="/opt/zator/.config_reset.$$" f
   cp -f /opt/zapret2/config "$old_scope_cfg" 2>/dev/null || true
   echo -e "${yellow}Конфиг обновлен (UTC +0): $(z2r_github_commit_date config.default) ${plain}"
 
   z2r_service_action stop
 
   rm -f /opt/zapret2/init.d/{sysv,openwrt}/custom.d/{50-discord-media,50-stun4all}
-  rm -rf /opt/zator/lists /opt/zator/extra_strats
+  # Сбрасываются только листы и локи: остальной extra_strats/cache (deploy,
+  # sources.env, zapret2_flavor, provider.txt, client_scope.tsv, scopes/) — настройки.
+  rm -rf "$stash"
+  mkdir -p "$stash/extra_strats/cache/orchestra" "$stash/files/fake"
+  [ -d /opt/zator/lists ] && mv /opt/zator/lists "$stash/lists"
+  for f in /opt/zator/extra_strats/*.txt; do [ -f "$f" ] && mv -f "$f" "$stash/extra_strats/"; done
+  for f in /opt/zator/extra_strats/cache/orchestra/*.tsv; do [ -f "$f" ] && mv -f "$f" "$stash/extra_strats/cache/orchestra/"; done
 
-  rm -f /opt/zator/files/fake/http_fake_MS.bin \
+  for f in /opt/zator/files/fake/http_fake_MS.bin \
         /opt/zator/files/fake/quic_{1..7}.bin \
         /opt/zator/files/fake/syn_packet.bin \
         /opt/zator/files/fake/tls_clienthello_{1..18}.bin \
         /opt/zator/files/fake/tls_clienthello_2n.bin \
         /opt/zator/files/fake/tls_clienthello_6a.bin \
-        /opt/zator/files/fake/tls_clienthello_4pda_to.bin
+        /opt/zator/files/fake/tls_clienthello_4pda_to.bin; do
+    [ -f "$f" ] && mv -f "$f" "$stash/files/fake/"
+  done
 
-  # При сетевом сбое get_repo вернёт 1: отменяем сброс конфига и возвращаем
-  # сервис обратно, иначе zapret2 останется остановленным на полуобновлённом состоянии.
+  # При сетевом сбое get_repo вернёт 1: возвращаем листы/локи/фейки из stash и
+  # сервис обратно, иначе zapret2 стартует без хостлистов и блобов из config.
   if ! get_repo; then
-    echo -e "${red}Не удалось обновить компоненты (сеть). Операция отменена.${plain}"
+    rm -rf /opt/zator/lists
+    [ -d "$stash/lists" ] && mv "$stash/lists" /opt/zator/lists
+    rm -f /opt/zator/extra_strats/*.txt
+    mkdir -p /opt/zator/extra_strats/cache/orchestra /opt/zator/files/fake
+    for f in "$stash"/extra_strats/*.txt; do [ -f "$f" ] && mv -f "$f" /opt/zator/extra_strats/; done
+    for f in "$stash"/extra_strats/cache/orchestra/*.tsv; do [ -f "$f" ] && mv -f "$f" /opt/zator/extra_strats/cache/orchestra/; done
+    for f in "$stash"/files/fake/*; do [ -f "$f" ] && mv -f "$f" /opt/zator/files/fake/; done
+    rm -rf "$stash"
+    echo -e "${red}Не удалось обновить компоненты (сеть). Операция отменена, листы и локи возвращены.${plain}"
     rm -f "$old_scope_cfg"
     z2r_service_action start >/dev/null 2>&1 || true
     return 1
   fi
+  rm -rf "$stash"
 
   if [ ! -f /opt/zator/files/fake/custom_tls.bin ]; then
     mkdir -p /opt/zator/files/fake
@@ -159,9 +192,12 @@ fwtype_apply() {
     return 0
   fi
 
+  # stop — пока в config старый FWTYPE: init снимает правила только того
+  # бэкенда, что прописан в config, иначе старые NFQUEUE-правила остаются.
+  z2r_service_action stop || true
   config_set_var "$cfg" FWTYPE "$target"
-  /opt/zapret2/install_prereq.sh
-  z2r_service_action restart
+  /opt/zapret2/install_prereq.sh || true
+  z2r_service_action start || true
   echo -e "${green}Zapret mode: $target.${plain}"
   return 0
 }
@@ -180,7 +216,9 @@ menu_action_toggle_udp_range() {
     echo -e "${green}Стратегия UDP обхода ДЕактивирована. Выделенные порты 1026-65531 убраны${plain}"
 
   elif [ "$state" = "Выключен" ]; then
-    new_ports="$(csv_add_tokens "" "1026-65531,${current_ports:-443}")"
+    # Диапазон — после базы (справа от якоря 443): слева он считался бы
+    # пользовательским портом и удалялся бы из меню портов (как в WebUI).
+    new_ports="$(csv_add_tokens "${current_ports:-443}" "1026-65531")"
     config_set_var "$cfg" NFQWS2_PORTS_UDP "$new_ports"
     backup_smart_set_udp_games "$cfg" 1
     echo -e "${green}Стратегия UDP обхода активирована. Выделены порты 1026-65531${plain}"
@@ -348,7 +386,7 @@ menu_action_set_tls_blob() {
     return 0
   fi
 
-  selected_blob="${blobs[$((choice-2))]}"
+  selected_blob="${blobs[$((10#$choice-2))]}"
 
   if ! grep -qE -- "--blob=maxru:@/opt/(zapret2|zator)/files/fake/" "$cfg"; then
     echo -e "${red}Строка --blob=maxru:@.../files/fake/... не найдена в $cfg${plain}"
@@ -540,7 +578,7 @@ menu_action_set_wg_blob() {
     return 1
   fi
 
-  selected_blob="${blobs[$((choice-1))]}"
+  selected_blob="${blobs[$((10#$choice-1))]}"
 
   if [ "$sed_ereg" = "-E" ]; then
     sed -i -E "s#--blob=fakewgblob:@/opt/(zapret2|zator)/files/fake/[^[:space:]]+#${prefix}${selected_blob}#g" "$cfg"
@@ -688,7 +726,7 @@ toggle_auto_mode() {
   done
 
   echo -e "${green}Авторежим: $(config_mode_text auto_mode /opt/zapret2/config).${plain}"
-  if pidof nfqws2 >/dev/null 2>&1; then
+  if zapret2_running; then
     if z2r_service_action restart; then
       echo -e "${green}zapret2 перезапущен для применения авторежима.${plain}"
     else
@@ -799,6 +837,7 @@ ports_validate() {
   local token="$1" start end
   case "$token" in
     ""|*[!0-9-]*) return 1 ;;  # пусто или недопустимые символы
+    0*|*-0*) return 1 ;;  # ведущий ноль: iptables/nft читают 0443 как восьмеричное 291
   esac
   if printf '%s' "$token" | grep -q -- '-'; then
     # диапазон START-END
@@ -967,7 +1006,13 @@ ports_manage() {
           sleep 1
           continue
         fi
-        target="${ports[$((choice-1))]}"
+        target="${ports[$((10#$choice-1))]}"
+        # Легаси-конфиги держат диапазон слева от 443; им управляет тумблер п.10.
+        if [ "$proto" = "udp" ] && [ "$target" = "1026-65531" ]; then
+          echo -e "${yellow}Диапазон 1026-65531 управляется переключателем игрового UDP (пункт 10).${plain}"
+          pause_enter
+          continue
+        fi
         echo ""
         echo -e "${yellow}Удалить порт ${green}${target}${yellow} из строки $var?"
         [ "$proto" = "tcp" ] && echo "(также убирается из стратегии RKN)"
@@ -1016,7 +1061,11 @@ ports_menu_status() {
 
 Z2R_BACKUP_DIR="/opt/zator_backup"
 
+# $1 — корень, где перечисляются динамические файлы (по умолчанию живой
+# ZATOR_ROOT). Восстановление передаёт распакованный архив: после сброса или
+# переустановки этих файлов на устройстве нет, и по живому списку они бы не вернулись.
 z2r_backup_state_files() {
+  local root="${1:-${ZATOR_ROOT:-/opt/zator}}" f
   cat <<'EOF'
 lists/netrogat.txt
 lists/netrogat_substrings.txt
@@ -1029,13 +1078,19 @@ extra_strats/cache/orchestra/blob_override.tsv
 extra_strats/cache/orchestra/sni_override.tsv
 extra_strats/cache/orchestra/mode_override.tsv
 extra_strats/cache/orchestra/clonesize.tsv
+extra_strats/cache/orchestra/sweep_history.tsv
+extra_strats/cache/client_scope.tsv
 EOF
   # самый свежий архив результатов суперавтопрогона едет в бэкапе вместе с
   # locked.tsv (только последний — историю ротация хранит в cache/supersweep)
   local ss_dir ss_newest
-  ss_dir="${ZATOR_ROOT:-/opt/zator}/extra_strats/cache/orchestra/supersweep"
+  ss_dir="$root/extra_strats/cache/orchestra/supersweep"
   ss_newest="$(ls -1t "$ss_dir"/supersweep-*.tar 2>/dev/null | head -n1)"
   [ -n "$ss_newest" ] && printf 'extra_strats/cache/orchestra/supersweep/%s\n' "$(basename "$ss_newest")"
+  # per-client локи Client scopes: без них восстановленный CLIENT_SCOPE_ENABLE=1 пуст
+  for f in "$root"/extra_strats/cache/orchestra/scopes/mark_*.tsv; do
+    [ -f "$f" ] && printf 'extra_strats/cache/orchestra/scopes/%s\n' "${f##*/}"
+  done
   return 0
 }
 
@@ -1135,6 +1190,8 @@ backup_create_core() {
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     src="/opt/zator/$rel"
+    # живые авто-локи — в /tmp, копия в /opt пишется раз в 30 минут и отстаёт
+    [ "$rel" = "extra_strats/cache/orchestra/auto_locked.tsv" ] && [ -s /tmp/auto_locked.tsv ] && src="/tmp/auto_locked.tsv"
     [ -f "$src" ] || continue
     mkdir -p "$stage/$(dirname "$rel")"
     cp -f "$src" "$stage/$rel" || { rm -rf "$stage" "$tmp_list"; return 1; }
@@ -1267,7 +1324,7 @@ backup_update_offer_restore() {
         echo -e "${green}Обновлённый config оставлен без изменений.${plain}"
         ;;
     esac
-    if ! pidof nfqws2 >/dev/null 2>&1; then
+    if ! zapret2_running; then
       z2r_service_action start >/dev/null 2>&1 || true
       echo -e "${green}zapret2 запущен.${plain}"
     fi
@@ -1334,12 +1391,14 @@ backup_check_blobs() {
 # =============================================================================
 
 # Точечный перенос портов NFQWS2_PORTS_TCP / NFQWS2_PORTS_UDP.
-# Значения целиком берутся из старого конфига и записываются в новый через
-# штатный config_set_var. Для TCP дополнительно синхронизируется --filter-tcp
-# блока RKN через ports_set_rkn_filter() — как при ручном добавлении портов.
+# Из старого конфига берутся только пользовательские порты (слева от якоря
+# 80/443), база — из нового: иначе теряются дефолтные порты нового релиза
+# (53 → антиспуф DNS «Выключен»). Порты тумблеров ведут свои шаги: DNS — флаги,
+# голос — лок профиля 6, игровой диапазон переносится здесь. Для TCP
+# дополнительно синхронизируется --filter-tcp блока RKN через ports_set_rkn_filter().
 backup_smart_apply_ports() {
   local old_cfg="$1" new_cfg="$2"
-  local old_tcp old_udp new_tcp_user
+  local old_tcp old_udp new_tcp_user old_udp_user new_udp
 
   [ -f "$old_cfg" ] && [ -f "$new_cfg" ] || return 0
 
@@ -1347,14 +1406,22 @@ backup_smart_apply_ports() {
   old_udp="$(config_get_var "$old_cfg" NFQWS2_PORTS_UDP)"
 
   if [ -n "$old_tcp" ]; then
-    config_set_var "$new_cfg" NFQWS2_PORTS_TCP "$old_tcp"
-    # Синхронизация --filter-tcp блока RKN = пользовательские порты + база.
     ports_split "$old_tcp" "80"
     new_tcp_user="$_PORTS_USER"
+    ports_split "$(config_get_var "$new_cfg" NFQWS2_PORTS_TCP)" "80"
+    new_tcp_user="$(csv_remove_tokens "$new_tcp_user" "$_PORTS_BASE")"
+    config_set_var "$new_cfg" NFQWS2_PORTS_TCP "$(ports_join "$new_tcp_user" "$_PORTS_BASE")"
+    # Синхронизация --filter-tcp блока RKN = пользовательские порты + база.
     ports_set_rkn_filter "$new_cfg" "$new_tcp_user"
   fi
   if [ -n "$old_udp" ]; then
-    config_set_var "$new_cfg" NFQWS2_PORTS_UDP "$old_udp"
+    ports_split "$old_udp" "443"
+    old_udp_user="$_PORTS_USER"
+    ports_split "$(config_get_var "$new_cfg" NFQWS2_PORTS_UDP)" "443"
+    old_udp_user="$(csv_remove_tokens "$old_udp_user" "$_PORTS_BASE")"
+    new_udp="$(ports_join "$old_udp_user" "$_PORTS_BASE")"
+    csv_contains_token "$old_udp" "1026-65531" && new_udp="$(csv_add_tokens "$new_udp" "1026-65531")"
+    config_set_var "$new_cfg" NFQWS2_PORTS_UDP "$new_udp"
   fi
   return 0
 }
@@ -1452,22 +1519,26 @@ backup_smart_set_fallback() {
 
 # Пункт 18: защита от RST-инъекций. circular_locked <-> rst_guard_locked (key 1,2,3,4,8,9).
 # Повторяет логическое ядро toggle_rst_guard_mode(), но для одного cfg.
+# RST без payload nfqws2 метит как empty: без ',empty' в --payload профилей
+# AUTO_STANDARD (1/2/3/3S/4/8) RST до rst_guard не доходит. Диапазон — только
+# AUTO_STANDARD: в AUTO_3/AUTO_4 ',empty' штатный, выключение его не трогает.
+# Ключ якорится ':' — иначе key=1 цепляет key=10 (DNS-профиль).
 backup_smart_set_rst_guard() {
   local cfg="$1" want_on="$2"
   local key
   if [ "$want_on" = "1" ]; then
     sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--filter-tcp=443 --filter-l7=tls$/--filter-tcp=443/' "$cfg"
     sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--skip --filter-tcp=443 --filter-l7=tls$/--skip --filter-tcp=443/' "$cfg"
-    sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello$/--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty/' "$cfg"
+    sed -i '/#Z2R_AUTO_STANDARD_BEGIN/,/#Z2R_AUTO_STANDARD_END/ s/^--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello$/--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty/' "$cfg"
     for key in 1 2 3 4 8 9; do
-      sed -i "s/--lua-desync=circular_locked:key=$key/--lua-desync=rst_guard_locked:key=$key/g" "$cfg"
+      sed -i "s/--lua-desync=circular_locked:key=$key:/--lua-desync=rst_guard_locked:key=$key:/g" "$cfg"
     done
   else
     sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--filter-tcp=443$/--filter-tcp=443 --filter-l7=tls/' "$cfg"
     sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--skip --filter-tcp=443$/--skip --filter-tcp=443 --filter-l7=tls/' "$cfg"
-    sed -i '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/ s/^--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty$/--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello/' "$cfg"
+    sed -i '/#Z2R_AUTO_STANDARD_BEGIN/,/#Z2R_AUTO_STANDARD_END/ s/^--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty$/--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello/' "$cfg"
     for key in 1 2 3 4 8 9; do
-      sed -i "s/--lua-desync=rst_guard_locked:key=$key/--lua-desync=circular_locked:key=$key/g" "$cfg"
+      sed -i "s/--lua-desync=rst_guard_locked:key=$key:/--lua-desync=circular_locked:key=$key:/g" "$cfg"
     done
   fi
 }
@@ -1790,9 +1861,17 @@ menu_action_backup_restore() {
     fi
   fi
 
-  # Останавливаем zapret2 перед накатом файлов.
+  # Режим 3 без config в архиве невозможен — проверяем до остановки zapret2.
+  if [ "$mode" = "3" ] && [ ! -f "$restore_dir/config" ]; then
+    rm -rf "$restore_dir"
+    echo -e "${red}В архиве нет config — умный перенос невозможен.${plain}"
+    return 1
+  fi
+
+  # Останавливаем zapret2 перед накатом файлов. Каждый выход с ошибкой ниже
+  # возвращает сервис, если он работал: иначе обход остаётся выключенным.
   was_running=0
-  if pidof nfqws2 >/dev/null 2>&1; then
+  if zapret2_running; then
     was_running=1
   fi
   z2r_service_action stop 2>/dev/null || true
@@ -1806,6 +1885,7 @@ menu_action_backup_restore() {
       else
         rm -rf "$restore_dir"
         echo -e "${red}Ошибка восстановления config.${plain}"
+        [ "$was_running" = "1" ] && z2r_service_action start >/dev/null 2>&1 || true
         return 1
       fi
     else
@@ -1817,6 +1897,7 @@ menu_action_backup_restore() {
     # идёт по совпадению имён и переносит только существующие на устройстве файлы.
     if ! menu_action_backup_restore_smart "$restore_dir/config" /opt/zapret2/config; then
       rm -rf "$restore_dir"
+      [ "$was_running" = "1" ] && z2r_service_action start >/dev/null 2>&1 || true
       return 1
     fi
   else
@@ -1825,7 +1906,7 @@ menu_action_backup_restore() {
 
   # Пользовательские списки/состояния/блокировки (оба режима).
   tmp_list="/tmp/z2r_state_list_$$"
-  z2r_backup_state_files > "$tmp_list"
+  z2r_backup_state_files "$restore_dir" > "$tmp_list"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     src="$restore_dir/$rel"
@@ -1835,13 +1916,25 @@ menu_action_backup_restore() {
     if ! cp -f "$src" "$dst"; then
       rm -rf "$restore_dir" "$tmp_list"
       echo -e "${red}Ошибка восстановления $rel.${plain}"
+      [ "$was_running" = "1" ] && z2r_service_action start >/dev/null 2>&1 || true
       return 1
     fi
   done < "$tmp_list"
   rm -f "$tmp_list"
   echo -e "${green}Списки доменов и номера стратегий восстановлены.${plain}"
 
+  # SLM читает /tmp/auto_locked.tsv раньше копии в /opt: без удаления
+  # восстановленные авто-локи игнорировались бы и затирались из памяти.
+  if [ -f "$restore_dir/extra_strats/cache/orchestra/auto_locked.tsv" ]; then
+    rm -f /tmp/auto_locked.tsv
+  fi
   rm -rf "$restore_dir"
+
+  # Профиль 6 зеркалится в config голосовыми портами: режим 2 возвращает лок
+  # без config, порты приводим к восстановленному локу (no-op, если совпадают).
+  config_profile_voice_ports_apply /opt/zapret2/config "$(profile_state_get 6 udp)" || true
+  # Client scopes: Lua-конфиг и правила firewall — по восстановленным config и карте.
+  client_scope_firewall_reconcile >/dev/null 2>&1 || true
 
   # Перезапуск, если zapret2 был активен.
   if [ "$was_running" = "1" ]; then

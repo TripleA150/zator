@@ -34,6 +34,7 @@ _client_scopes_profile_label() {
     7) echo "UDP Games" ;;
     8) echo "Fallback TLS" ;;
     9) echo "Fallback HTTP" ;;
+    10) echo "DNS" ;;
     *) echo "профиль $1" ;;
   esac
 }
@@ -43,7 +44,7 @@ _client_scopes_profile_label() {
 _client_scopes_lock_entry() {
   local target="$1" proto="$2" strat="$3" label
   case "$target" in
-    [1-9]) label="$(_client_scopes_profile_label "$target")" ;;
+    [1-9]|10) label="$(_client_scopes_profile_label "$target")" ;;
     *) label="$target" ;;
   esac
   if [ "$strat" = 0 ]; then
@@ -100,7 +101,7 @@ _client_scopes_print_locks() {
   while IFS="$tab" read -r target proto strat; do
     [ -n "$target" ] || continue
     case "$target" in
-      [1-9]) proles="${proles}${target}${tab}${proto}${tab}${strat}
+      [1-9]|10) proles="${proles}${target}${tab}${proto}${tab}${strat}
 " ;;
       *) domains="${domains}${target}${tab}${proto}${tab}${strat}
 " ;;
@@ -110,7 +111,7 @@ _client_scopes_print_locks() {
   echo ""
   echo -e "  ${cyan}Локи (${scope}):${plain}"
   if [ -n "$proles" ]; then
-    printf '%s' "$proles" | LC_ALL=C sort | while IFS="$tab" read -r target proto strat; do
+    printf '%s' "$proles" | LC_ALL=C sort -n | while IFS="$tab" read -r target proto strat; do
       if [ -n "$target" ]; then
         _client_scopes_lock_entry "$target" "$proto" "$strat"
       fi
@@ -397,7 +398,9 @@ client_scopes_ask_scope_for_strategies() {
     case "$ans" in
       0) return 1 ;;
       "$del")
-        client_scopes_wizard_remove
+        # пауза: иначе clear -x в начале цикла стирает итог удаления
+        client_scopes_wizard_remove || true
+        pause_enter
         continue
         ;;
       "$extra")
@@ -414,6 +417,7 @@ client_scopes_ask_scope_for_strategies() {
           return 0
         fi
         echo -e "${red}Не удалось сохранить маппинг (проверьте IP и firewall backend).${plain}"
+        pause_enter
         continue
         ;;
       *)
@@ -421,7 +425,7 @@ client_scopes_ask_scope_for_strategies() {
           CLIENT_SCOPE_ASK_RESULT="$(sed -n "${ans}p" <<< "$list")"
           return 0
         fi
-        echo -e "${red}Неверный ввод.${plain}" ;;
+        ui_invalid_input ;;
     esac
   done
 }
@@ -1034,7 +1038,7 @@ strategies_submenu() {
         fi
         ;;
       "11")
-        toggle_auto_mode
+        toggle_auto_mode || true
         pause_enter
         ;;
       "12")
@@ -1100,10 +1104,10 @@ domains_submenu() {
         manage_custom_rkn_list
         ;;
       "5")
-        rkn_substring_add_line
+        rkn_substring_add_line || true
         ;;
       "6")
-        rkn_substring_manage_lines
+        rkn_substring_manage_lines || true
         ;;
       "7")
         netrogat_substring_add_line
@@ -1193,8 +1197,8 @@ flowoffload_submenu() {
           4) val="donttouch" ;;
         esac
         config_set_var /opt/zapret2/config FLOWOFFLOAD "$val"
-        /opt/zapret2/install_prereq.sh
-        z2r_service_action restart
+        /opt/zapret2/install_prereq.sh || true
+        z2r_service_action restart || true
         echo -e "${green}FLOWOFFLOAD=$val применён.${plain}"
         pause_enter
         ;;
@@ -1291,12 +1295,12 @@ tcp443_submenu() {
             pause_enter
             continue
           fi
-          z2r_service_action restart
+          z2r_service_action restart || true
           echo -e "${green}Выполнена команда перезапуска zapret. ${yellow}Безразборный режим активирован на $answer_bezr стратегии для TCP-443. Проверка доступа к meduza.io${plain}"
           check_access_list
         else
           config_tcp443_set_strategy 0 "$cfg"
-          z2r_service_action restart
+          z2r_service_action restart || true
           echo -e "${green}Выполнена команда перезапуска zapret${plain}"
           echo "Безразборный режим отключен"
         fi
@@ -1506,7 +1510,9 @@ tls_blob_profile_pick() {
       fi
       pause_enter
     elif ui_is_number_in_range "$choice" 3 "$(( ${#files[@]} + 2 ))"; then
-      file="${files[$((choice-3))]}"
+      # 10#: «08»/«09» иначе — ошибка восьмеричной арифметики, bash
+      # бросает всю составную команду z2r.sh и проваливается в переустановку
+      file="${files[$((10#$choice-3))]}"
       if ! grep -qE -- "--blob=${slot}:@/opt/(zapret2|zator)/files/fake/" "$cfg"; then
         echo -e "${red}В конфиге нет декларации --blob=${slot} (старый конфиг).${plain}"
         echo -e "${yellow}Примените новый config.default: п.5 -> п.7, затем повторите.${plain}"
@@ -1573,7 +1579,7 @@ tls_blob_submenu() {
         return
         ;;
       "1")
-        menu_action_set_tls_blob
+        menu_action_set_tls_blob || true
         ;;
       "$sni_item")
         sni_submenu
@@ -1586,7 +1592,7 @@ tls_blob_submenu() {
         ;;
       *)
         if ui_is_number_in_range "$ans" 2 "$(( ${#profiles[@]} + 1 ))"; then
-          idx=$((ans-2))
+          idx=$((10#$ans-2))
           tls_blob_profile_pick "${profiles[$idx]}" "${titles[$idx]}" "$cfg"
         else
           ui_invalid_input
@@ -1645,7 +1651,7 @@ sni_profile_pick() {
       fi
       pause_enter
     elif ui_is_number_in_range "$choice" 1 "${#presets[@]}"; then
-      preset="${presets[$((choice-1))]}"
+      preset="${presets[$((10#$choice-1))]}"
       if sni_override_set "$profile" "$preset"; then
         echo -e "${green}Профиль $profile: клон-стратегии используют SNI ${preset}.${plain}"
         echo -e "${yellow}Применится сам в течение ~2 секунд, рестарт не нужен.${plain}"
@@ -1710,7 +1716,7 @@ sni_submenu() {
     if [ "$ans" = "0" ] || [ -z "$ans" ]; then
       return
     elif ui_is_number_in_range "$ans" 1 "$(( ${#profiles[@]} ))"; then
-      idx=$((ans-1))
+      idx=$((10#$ans-1))
       sni_profile_pick "${profiles[$idx]}" "${titles[$idx]}"
     else
       ui_invalid_input
@@ -1835,7 +1841,7 @@ fake_mode_submenu() {
     if [ "$ans" = "0" ] || [ -z "$ans" ]; then
       return
     elif ui_is_number_in_range "$ans" 1 "$(( ${#profiles[@]} ))"; then
-      idx=$((ans-1))
+      idx=$((10#$ans-1))
       fake_mode_profile_pick "${profiles[$idx]}" "${titles[$idx]}"
     elif [ "$ans" = "$all_clone" ]; then
       # ВРЕМЕННЫЙ ГЕЙТ (просьба владельца, 2026-10): Discord не включаем
@@ -1943,7 +1949,7 @@ clone_size_profile_pick() {
       fi
       pause_enter
     elif ui_is_number_in_range "$choice" 2 "$(( custom_idx - 1 ))"; then
-      preset="${presets[$((choice-2))]}"
+      preset="${presets[$((10#$choice-2))]}"
       if clone_size_set "$profile" "$preset"; then
         echo -e "${green}Профиль $profile: клон-пакеты не больше ${preset} Б.${plain}"
         echo -e "${yellow}Клоны больше лимита режутся согласованно (без post-quantum key_share);${plain}"
@@ -1992,10 +1998,9 @@ clone_size_submenu() {
     clear -x
     echo -e "${cyan}--- Размер клон-пакетов (лимит байт по профилям) ---${plain}"
     echo ""
-    echo -e "${yellow}Действует в режиме клонов: клон отправляется только целым${plain}"
-    echo -e "${yellow}в пределах лимита; клоны больше лимита не шлются — штатный блоб.${plain}"
+    echo -e "${yellow}Действует в режиме клонов: клоны больше лимита режутся согласованно${plain}"
+    echo -e "${yellow}(без post-quantum key_share); не влезло — штатный блоб.${plain}"
     echo -e "${yellow}Нет строки = граница ТСПУ 1200 Б. Меняется на лету, рестарт не нужен.${plain}"
-    echo -e "${yellow}Меняется на лету, рестарт zapret2 не нужен.${plain}"
     echo ""
     i=1
     for idx in "${!profiles[@]}"; do
@@ -2014,7 +2019,7 @@ clone_size_submenu() {
     if [ "$ans" = "0" ] || [ -z "$ans" ]; then
       return
     elif ui_is_number_in_range "$ans" 1 "$(( ${#profiles[@]} ))"; then
-      idx=$((ans-1))
+      idx=$((10#$ans-1))
       clone_size_profile_pick "${profiles[$idx]}" "${titles[$idx]}"
     else
       ui_invalid_input
@@ -2378,8 +2383,8 @@ advanced_settings_submenu() {
     case "$ans" in
       "1")
         if menu_action_toggle_reasm_disable; then
-          if pidof nfqws2 >/dev/null; then
-            z2r_service_action restart
+          if zapret2_running; then
+            z2r_service_action restart || true
             echo -e "${green}zapret2 перезапущен для применения изменений.${plain}"
           fi
         fi
@@ -2425,8 +2430,8 @@ keenetic_policy_submenu() {
     echo ""
     read -re -p "Ваш выбор: " ans
     case "$ans" in
-      "1") menu_action_set_keenetic_policy_name; pause_enter ;;
-      "2") menu_action_toggle_keenetic_policy_mode; pause_enter ;;
+      "1") menu_action_set_keenetic_policy_name || true; pause_enter ;;
+      "2") menu_action_toggle_keenetic_policy_mode || true; pause_enter ;;
       "0"|"") return ;;
       *) ui_invalid_input ;;
     esac

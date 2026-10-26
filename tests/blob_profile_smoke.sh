@@ -171,4 +171,31 @@ if tls_blob_profile_apply_file "$CFG_NO_SLOT" 3 tls_clienthello_test_a.bin; then
   fail "apply_file должен отказывать без декларации слота"
 fi
 
+# --- 4. Ввод с ведущим нулём в tls_blob_profile_pick ------------------------
+# «08» раньше давал ошибку восьмеричной арифметики: bash бросал составную
+# команду z2r.sh и проваливался в переустановку; «010» выбирал пункт №8.
+
+for n in 1 2 3 4 5 6; do printf 'Z' > "$ROOT/files/fake/tls_z$n.bin"; done
+# Список: 3 custom_tls, 4 tls_clienthello_test_a, 5..10 tls_z1..tls_z6.
+pick_out="$(
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/submenus.sh"
+  clear() { :; }
+  pause_enter() { :; }
+  telemetry_notify() { :; }
+  set +u   # как в z2r.sh: только set -e, цвета меню не объявлены
+  if true; then
+    tls_blob_profile_pick 1 YouTube "$CFG" <<< $'08\n0' >/dev/null
+  fi
+  echo "after08=$(grep -o 'z2r_prof_1:@[^ ]*' "$CFG")"
+  if true; then
+    tls_blob_profile_pick 1 YouTube "$CFG" <<< $'010\n0' >/dev/null
+  fi
+  echo "after010=$(grep -o 'z2r_prof_1:@[^ ]*' "$CFG")"
+)" || fail "tls_blob_profile_pick упал на вводе с ведущим нулём"
+grep -q '^after08=.*/tls_z4\.bin$' <<<"$pick_out" \
+  || fail "«08» не выбрал пункт №8 (tls_z4.bin): $pick_out"
+grep -q '^after010=.*/tls_z6\.bin$' <<<"$pick_out" \
+  || fail "«010» не выбрал пункт №10 (tls_z6.bin): $pick_out"
+
 echo "blob profile smoke ok"

@@ -3,7 +3,8 @@
 set -e
 
 INSTALL_DIR="${Z2R_INSTALL_DIR:-/opt}"
-LIB_FILES="ui.sh provider.sh telemetry.sh recommendations.sh netcheck.sh premium.sh strategies.sh submenus.sh actions.sh config.sh orchestra_state.sh"
+# держать синхронно с Z2R_LIB_FILES в z2r.sh
+LIB_FILES="ui.sh provider.sh telemetry.sh recommendations.sh netcheck.sh premium.sh strategies.sh supersweep.sh supersweep_probe.sh supersweep_transport.sh submenus.sh actions.sh config.sh orchestra_state.sh"
 
 fail() {
     echo "Ошибка: $*" >&2

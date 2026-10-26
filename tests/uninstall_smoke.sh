@@ -223,6 +223,13 @@ printf '%s\n' "$ctx" | grep -q 'backup_helper_ask_and_create' \
   || fail "переустановка сносит /opt/zapret2/config без предложения бэкапа"
 printf '%s\n' "$ctx" | grep -q 'ZAPRET2_ROOT/config' \
   || fail "предложение бэкапа не ограничено наличием config"
+# Новый zapret2 скачивается и готовится ДО сноса: сбой загрузки не оставляет роутер без обхода.
+get_ln="$(grep -n '^ if ! zapret_get; then$' "$REPO_DIR/z2r.sh" | cut -d: -f1)"
+rm_ln="$(grep -n '^ remove_zapret$' "$REPO_DIR/z2r.sh" | cut -d: -f1)"
+[ -n "$get_ln" ] && [ -n "$rm_ln" ] && [ "$get_ln" -lt "$rm_ln" ] \
+  || fail "zapret_get должен идти до remove_zapret (сбой загрузки сносит рабочую установку)"
+printf '%s\n' "$INSTALL_BODY" | sed -n 2p | grep -qx ' zapret_install_staged' \
+  || fail "сразу после remove_zapret должна идти подмена подготовленным деревом"
 body="$(sed -n '/^remove_zapret()/,/^}/p' "$REPO_DIR/z2r.sh")"
 printf '%s\n' "$body" | grep -q 'webui_remove' \
   && fail "remove_zapret удаляет файлы Web-панели из \$ZATOR_ROOT при переустановке zapret2"

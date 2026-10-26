@@ -304,6 +304,16 @@ case "$state" in
   *) fail "nfqws2_state: живой nfqws2 должен давать run с его pid, получено: $state" ;;
 esac
 kill "$FOREIGN_PID" "$NFQ2_PID" 2>/dev/null || true
+# мёртвый pidfile + живой посторонний nfqws2 (проба суперсвипа, blockcheck2):
+# раньше pidof давал «run» и упавший прод не перезапускался до конца свипа
+echo 999999 >"$ENT_RUNDIR/nfqws2_1.pid"
+pidof() { echo 4242; }
+state=$(nfqws2_state)
+[ "$state" = "crash" ] || fail "nfqws2_state: посторонний nfqws2 замаскировал падение (pidof при мёртвом pidfile), получено: $state"
+rm -f "$ENT_RUNDIR/nfqws2_1.pid"
+state=$(nfqws2_state)
+[ "$state" = "run 4242" ] || fail "nfqws2_state: без pidfile процесс должен искаться по имени, получено: $state"
+unset -f pidof
 ok "nfqws2_state: переиспользованный pid = crash, настоящий nfqws2 = run"
 
 # --- Entware: safe_err_files — только обычные root-файлы, симлинки мимо ---
@@ -338,6 +348,14 @@ if echo x >"$ENT_ERRDIR/nfqws2_3.err" \
     *) : ;;
   esac
 fi
+# stat в busybox Entware/Merlin выключен: проверка владельца не должна от него зависеть
+stat() { return 127; }
+safe=$(safe_err_files | tr '\n' ' ')
+unset -f stat
+case "$safe" in
+  *nfqws2_1.err*) : ;;
+  *) fail "safe_err_files: без stat файл владельца выпал из выборки (OOM-ветка мертва), получено: $safe" ;;
+esac
 ok "safe_err_files: обычные файлы берём, симлинки и чужих владельцев игнорируем"
 
 # --- Entware: do_restart — старые маркеры ДО рестарта, код возврата в лог ---

@@ -199,6 +199,19 @@ else
 fi
 [ ! -s "$PROVIDER_CACHE" ] || fail "сценарий 17: мусорный ответ должен давать пустой provider.txt"
 
+# == 18. ipwho.is "asn":0 (префикс неизвестен) не обрывает каскад API ==
+(
+  curl() {
+    case "$*" in
+      *ipwho.is*) printf '%s' '{"success":true,"city":"Saint Petersburg","connection":{"asn":0,"isp":"Best-Hoster"}}' ;;
+      *ipinfo.io*) printf '%s' '{"city":"Saint Petersburg","org":"AS47119 Ufanet"}' ;;
+    esac
+  }
+  _detect_api_simple >/dev/null 2>&1 || fail "сценарий 18: детект упал"
+  [ "$PROVIDER_ASN" = 47119 ] || fail "сценарий 18: asn=0 не передал ход ipinfo (ASN=$PROVIDER_ASN)"
+  if grep -q 'AS0' "$PROVIDER_CACHE"; then fail "сценарий 18: в provider.txt попал AS0"; fi
+)
+
 # == доп: обычный init не делает сетевых запросов ==
 
 echo "Init - No Net" > "$PROVIDER_CACHE"

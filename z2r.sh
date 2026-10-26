@@ -2,9 +2,6 @@
 
 set -e
 
-#Переменная содержащая версию на случай невозможности получить информацию о lastest с github
-DEFAULT_VER="0.8.2"
-
 #Чтобы удобнее красить текст
 plain='\033[0m'
 red='\033[0;31m'
@@ -50,7 +47,6 @@ z2r_github_commit_date() {
 Z2R_BRANCH="${Z2R_BRANCH:-zator}"
 Z2R_PROJECT_RAW_BASE="${Z2R_PROJECT_RAW_BASE:-https://raw.githubusercontent.com/AloofLibra/zator/${Z2R_BRANCH}}"
 Z2R_PROJECT_MIRROR_BASE="${Z2R_PROJECT_MIRROR_BASE:-https://git.px.rkn.quest/AloofLibra/plain}"
-Z2R_INSTALLER_URL="${Z2R_INSTALLER_URL:-${Z2R_PROJECT_RAW_BASE}/z2r.sh}"
 ZAPRET2_UPSTREAM_RAW_BASE="${ZAPRET2_UPSTREAM_RAW_BASE:-https://raw.githubusercontent.com/bol-van/zapret2/master}"
 ZAPRET2_UPSTREAM_MIRROR_BASE="${ZAPRET2_UPSTREAM_MIRROR_BASE:-https://git.px.rkn.quest/zapret2/plain}"
 ZAPRET2_RELEASE_BASE="${ZAPRET2_RELEASE_BASE:-https://github.com/bol-van/zapret2/releases/download}"
@@ -130,10 +126,13 @@ z2r_download_project_file() {
     return 0
   fi
 
-  # Офлайн-сборка с tar-деплоем: установленное дерево уже актуально,
-  # локальный файл — источник, сеть не трогаем.
+  # Офлайн-сборка с tar-деплоем: установленное дерево zator уже актуально,
+  # локальный файл — источник, сеть не трогаем. Только $ZATOR_ROOT: файл в
+  # $ZAPRET2_ROOT пришёл из апстрим-архива (иниты), а не из zator.
   if [ "${Z2R_OFFLINE:-0}" = "1" ] && [ -f "$dest" ]; then
-    return 0
+    case "$dest" in
+      "$ZATOR_ROOT"/*) return 0 ;;
+    esac
   fi
 
   mirror="$(z2r_mirror_url "$rel")"
@@ -281,24 +280,6 @@ z2r_download_zapret2_release() {
   return 1
 }
 
-z2r_exec_external_installer() {
-  local mirror
-  local tmp="/tmp/z2r_installer_$$"
-
-  if [ "${Z2R_OFFLINE:-0}" = "1" ]; then
-    echo "Ошибка: в архиве отсутствуют дочерние библиотеки z2r."
-    exit 1
-  fi
-
-  mirror="$(z2r_mirror_url "z2r")"
-  if z2r_fetch_url_to_file "$tmp" "$Z2R_INSTALLER_URL" || z2r_fetch_url_to_file "$tmp" "$mirror"; then
-    exec sh "$tmp" "$@"
-  fi
-  rm -f "$tmp"
-  echo "Ошибка: не удалось загрузить внешний z2r."
-  exit 1
-}
-
 #___Проверка на наличие необходимых библиотек___#
 
 #Определяем путь скрипта, подгружаем функции
@@ -334,8 +315,9 @@ z2r_migrate_to_zator() {
     if [ ! -e "$dst" ]; then
       mv "$src" "$dst" 2>/dev/null || true
     else
-      cp -a "$src/." "$dst/" 2>/dev/null || true
-      rm -rf "$src" 2>/dev/null || true
+      # Источник удаляем только после полной копии: сбой cp (нет места)
+      # оставляет старый каталог — повтор при следующем запуске.
+      cp -a "$src/." "$dst/" 2>/dev/null && rm -rf "$src" 2>/dev/null || true
     fi
   done
 
@@ -387,7 +369,7 @@ z2r_migrate_to_zator() {
 
 z2r_migrate_to_zator
 
-# Проверяем наличие всех нужных lib-файлов, иначе запускаем внешний скрипт
+# Проверяем наличие всех нужных lib-файлов, недостающие докачиваем из репозитория
 missing_libs=0
 # Предпочитаем $ZATOR_ROOT/z2r_lib (новое расположение), fallback на
 # $ZAPRET2_ROOT/z2r_lib (legacy/сразу после первой установки внешним лаунчером).
@@ -404,8 +386,22 @@ for lib in $Z2R_LIB_FILES; do
 done
 
 if [ "$missing_libs" -ne 0 ]; then
-  echo "Не найдены нужные файлы в $LIB_DIR. Запускаю внешний z2r..."
-  z2r_exec_external_installer "$@"
+  if [ "${Z2R_OFFLINE:-0}" = "1" ]; then
+    echo "Ошибка: в архиве отсутствуют дочерние библиотеки z2r."
+    exit 1
+  fi
+  # Докачиваем сами: перезапуск скачанного z2r.sh упирался в ту же нехватку
+  # и зацикливался.
+  echo "Не найдены нужные файлы в $LIB_DIR. Докачиваю из репозитория..."
+  mkdir -p "$ZATOR_ROOT/z2r_lib"
+  for lib in $Z2R_LIB_FILES; do
+    [ -f "$ZATOR_ROOT/z2r_lib/$lib" ] && continue
+    z2r_download_project_file "$ZATOR_ROOT/z2r_lib/$lib" "lib/$lib" || {
+      echo "Ошибка: не удалось докачать lib/$lib."
+      exit 1
+    }
+  done
+  LIB_DIR="$ZATOR_ROOT/z2r_lib"
 fi
 
 #___Сначала идут анонсы функций____
@@ -755,7 +751,7 @@ if [ -f "$ZAPRET2_ROOT/config" ]; then
     rst_guard_lua_update_from_repo || true
   fi
   if [ ! -s "$CIRCULAR_DETECTOR_LUA" ] || [ ! -s "$SILENT_DROP_DETECTOR_LUA" ] || \
-     [ ! -s "$DNS_CLONE_LUA" ] || \
+     [ ! -s "$DNS_CLONE_LUA" ] || [ ! -s "$FAKE_ADAPT_LUA" ] || \
      [ ! -s "$STRATEGY_LOCK_MANAGER_LUA" ] || [ ! -s "$STRATEGY_VALIDATOR_WORKER" ]; then
     echo "Не найдены Lua-модули circular. Пытаюсь скачать из репозитория..."
     circular_runtime_update_from_repo || true
@@ -806,7 +802,7 @@ change_user() {
 	sed -i 's/^#\(WS_USER=nobody\)/\1/' "$ZAPRET2_ROOT/config.default"
    elif "$ZAPRET2_ROOT/nfq2/nfqws2" --dry-run --user="$(head -n1 /etc/passwd | cut -d: -f1)" 2>&1 | grep -q "queue"; then
     echo "WS_USER=$(head -n1 /etc/passwd | cut -d: -f1)"
-    sed -i "s/^#WS_USER=nobody$/WS_USER=$(head -n1 /etc/passwd | cut -d: -f1)/" "$ZAPRET2_ROOT/config.default"
+    sed -i "s/^#\?WS_USER=.*/WS_USER=$(head -n1 /etc/passwd | cut -d: -f1)/" "$ZAPRET2_ROOT/config.default"
    else
     echo -e "${yellow}WS_USER не подошёл. Скорее всего будут проблемы. Если что - пишите в саппорт${plain}"
    fi
@@ -824,6 +820,16 @@ ensure_nfqws2_stopped() {
     kill -9 "$pid" 2>/dev/null || true
   done
   sleep 1
+}
+
+# Запущен ли боевой nfqws2: probe фонового суперпрогона (qnum=65535) — тоже
+# nfqws2, но zapret2 не считается (тот же фильтр, что в ensure_nfqws2_stopped).
+z2r_prod_nfqws2_running() {
+  local pid
+  for pid in $(pidof nfqws2 2>/dev/null); do
+    grep -aq 'qnum=65535' "/proc/$pid/cmdline" 2>/dev/null || return 0
+  done
+  return 1
 }
 
 blockcheck2_run_summary() {
@@ -847,7 +853,7 @@ blockcheck2_run_summary() {
 
   blockcheck2_prepare_z4r_test || return 1
 
-  if pidof nfqws2 >/dev/null; then
+  if z2r_prod_nfqws2_running; then
     was_running=1
     ensure_nfqws2_stopped
     echo -e "${green}Выполнена команда остановки zapret2${plain}"
@@ -870,8 +876,13 @@ blockcheck2_run_summary() {
 
   echo -e "${yellow}Запускаю blockcheck2 TEST=$test_name для $test_target...${plain}"
   start_ts="$(date +%s)"
-  CURL_HTTPS_GET=1 BATCH=1 TEST="$test_name" DOMAINS="$test_target" ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=1 ENABLE_HTTPS_TLS13=1 ENABLE_HTTP3=0 BC2_PROGRESS_FILE="$progress_file" ZAPRET_BASE="$ZAPRET2_ROOT" "$blockcheck_path" >"$log_file" 2>&1 &
+  # Фоновая задача без job control стартует с игнором SIGINT, и ловушка
+  # blockcheck2 (снятие своих правил) не срабатывает: возвращаем INT по
+  # умолчанию. Сами переживаем Ctrl+C, чтобы дождаться его очистки и
+  # перезапустить zapret2.
+  ( trap - INT; CURL_HTTPS_GET=1 BATCH=1 TEST="$test_name" DOMAINS="$test_target" ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=1 ENABLE_HTTPS_TLS13=1 ENABLE_HTTP3=0 BC2_PROGRESS_FILE="$progress_file" ZAPRET_BASE="$ZAPRET2_ROOT" exec "$blockcheck_path" ) >"$log_file" 2>&1 &
   pid=$!
+  trap ':' INT
   if [ "$pid" -gt 0 ]; then
     local spin='|/-\' idx=0 pct=0 elapsed=0 elapsed_fmt="" overrun_notice=0
     local done=0 total=0 eta=0 eta_fmt=""
@@ -937,6 +948,7 @@ blockcheck2_run_summary() {
     z2r_service_action restart
     echo -e "${green}zapret2 восстановлен (restart)${plain}"
   fi
+  trap - INT
 
   return $rc
 }
@@ -1085,7 +1097,8 @@ get_repo() {
   else
     rst_guard_lua_update_from_repo || true
   fi
-  if [ "${Z2R_GET_REPO_SKIP_EXISTING:-0}" = "1" ] && [ -s "$CIRCULAR_DETECTOR_LUA" ] && [ -s "$SILENT_DROP_DETECTOR_LUA" ] && [ -s "$DNS_CLONE_LUA" ] && [ -s "$STRATEGY_LOCK_MANAGER_LUA" ]; then
+  # fake-adapt.lua грузится из config.default (--lua-init): без него nfqws2 не стартует
+  if [ "${Z2R_GET_REPO_SKIP_EXISTING:-0}" = "1" ] && [ -s "$CIRCULAR_DETECTOR_LUA" ] && [ -s "$SILENT_DROP_DETECTOR_LUA" ] && [ -s "$DNS_CLONE_LUA" ] && [ -s "$FAKE_ADAPT_LUA" ] && [ -s "$STRATEGY_LOCK_MANAGER_LUA" ] && [ -s "$STRATEGY_VALIDATOR_WORKER" ]; then
     :
   else
     circular_runtime_update_from_repo || return 1
@@ -1093,7 +1106,8 @@ get_repo() {
   if [ "${Z2R_GET_REPO_SKIP_EXISTING:-0}" = "1" ] && { [ -x "$STRATEGY_VALIDATOR_ENTWARE_INIT" ] || [ -x "$STRATEGY_VALIDATOR_OPENWRT_INIT" ] || [ -f "$STRATEGY_VALIDATOR_SYSTEMD_UNIT" ]; }; then
     :
   else
-    strategy_validator_install_service || return 1
+    # Вспомогательный сервис: без systemd/curl zapret2 ставится и без него.
+    strategy_validator_install_service || echo -e "${yellow}strategy-validator не установлен — zapret2 работает без него.${plain}"
   fi
   # netrogat.txt — пользовательский список исключений: существующий файл не
   # перезаписываем (иначе обновления затирают добавленные домены). Остальные
@@ -1137,15 +1151,9 @@ get_repo() {
     fi
   fi
   touch "$ZATOR_ROOT/lists/autohostlist.txt"
-  if [ -d /opt/extra_strats ]; then
-    rm -rf "$ZATOR_ROOT/extra_strats"
-    mv /opt/extra_strats "$ZATOR_ROOT/"
-    echo "Востановление настроек подбора из резерва выполнено."
-  fi
-  if [ ! -f "$ZATOR_ROOT/extra_strats/TCP_Custom.txt" ]; then
-    mkdir -p "$ZATOR_ROOT/extra_strats"
-    z2r_download_project_file "$ZATOR_ROOT/extra_strats/TCP_Custom.txt" "extra_strats/TCP/RKN/Custom.txt" || touch "$ZATOR_ROOT/extra_strats/TCP_Custom.txt"
-  fi
+  # Резервы /opt/extra_strats и /opt/netrogat.txt — формат z4r (zapret v1):
+  # $ZATOR_ROOT переживает обновление zapret2, восстанавливать из них нечего,
+  # а перенос поверх сносил листы и локи затора.
   if [ ! -f "$ZATOR_ROOT/extra_strats/TCP_RKN_domains_by_substring.txt" ]; then
     mkdir -p "$ZATOR_ROOT/extra_strats"
     z2r_download_project_file "$ZATOR_ROOT/extra_strats/TCP_RKN_domains_by_substring.txt" "extra_strats/TCP/RKN/Domains_By_Substring.txt" || touch "$ZATOR_ROOT/extra_strats/TCP_RKN_domains_by_substring.txt"
@@ -1156,10 +1164,6 @@ get_repo() {
   mkdir -p "$ZATOR_ROOT/data/providers"
   if z2r_repo_get "$ZATOR_ROOT/data/providers/asn.txt" "data/providers/asn.txt"; then
     grep -qE '^[0-9]+:' "$ZATOR_ROOT/data/providers/asn.txt" 2>/dev/null || rm -f "$ZATOR_ROOT/data/providers/asn.txt"
-  fi
-  if [ -f "/opt/netrogat.txt" ]; then
-    mv -f /opt/netrogat.txt "$ZATOR_ROOT/lists/netrogat.txt"
-    echo "Востановление листа исключений выполнено."
   fi
   # config.default и keenetic-policy.sh — zapret2-native, остаются в $ZAPRET2_ROOT.
  z2r_download_project_file "$ZAPRET2_ROOT/config.default" "config.default" || return 1
@@ -1190,11 +1194,16 @@ client_scope_config_snapshot() {
 }
 
 client_scope_config_restore() {
+  local target="$ZAPRET2_ROOT/config"
   [ -f "$CLIENT_SCOPE_CONFIG_SNAPSHOT" ] || return 0
-  [ -f "$ZAPRET2_ROOT/config" ] || { rm -f "$CLIENT_SCOPE_CONFIG_SNAPSHOT"; return 0; }
-  config_client_scope_apply "$CLIENT_SCOPE_CONFIG_SNAPSHOT" "$ZAPRET2_ROOT/config" || true
-  config_client_scope_ensure "$ZAPRET2_ROOT/config" || true
-  client_scope_lua_config_sync "$ZAPRET2_ROOT/config" || true
+  # Свежий архив zapret2 несёт только config.default: config из него позже
+  # создаёт install_easy.sh, поэтому переносим настройки в эталон.
+  [ -f "$target" ] || target="$ZAPRET2_ROOT/config.default"
+  [ -f "$target" ] || { rm -f "$CLIENT_SCOPE_CONFIG_SNAPSHOT"; return 0; }
+  config_client_scope_apply "$CLIENT_SCOPE_CONFIG_SNAPSHOT" "$target" || true
+  config_client_scope_ensure "$target" || true
+  client_scope_lua_config_sync "$target" || true
+  [ "${hardware:-}" = "keenetic" ] && { config_keenetic_policy_apply "$CLIENT_SCOPE_CONFIG_SNAPSHOT" "$target" || true; }
   rm -f "$CLIENT_SCOPE_CONFIG_SNAPSHOT"
 }
 
@@ -1247,7 +1256,11 @@ remove_zapret() {
  	   && grep -q 'zapret2' /opt/etc/ndm/netfilter.d/000-zapret.sh 2>/dev/null; then
  		rm -fv /opt/etc/ndm/netfilter.d/000-zapret.sh
  	fi
- 	rm -fv /opt/etc/init.d/S90-zapret /opt/etc/init.d/S90-zapret2 /opt/etc/ndm/netfilter.d/000-zapret2.sh /opt/etc/init.d/S00fix
+ 	# S90-zapret — автозапуск старого zapret (z4r): удаляем, только если он ведёт в zapret2
+ 	case "$(readlink /opt/etc/init.d/S90-zapret 2>/dev/null)" in
+ 		*zapret2*) rm -fv /opt/etc/init.d/S90-zapret ;;
+ 	esac
+ 	rm -fv /opt/etc/init.d/S90-zapret2 /opt/etc/ndm/netfilter.d/000-zapret2.sh /opt/etc/init.d/S00fix
  fi
 }
 
@@ -1345,6 +1358,7 @@ zapret2_flavor_prompt() {
 
 #Запрос желаемой версии zapret2
 version_select() {
+   local rel_json inst_ver
    if [ -n "${ZAPRET2_VERSION:-}" ]; then
     if ! z2r_version_valid "$ZAPRET2_VERSION"; then
       echo -e "${red}Некорректная версия zapret2 из архива: $ZAPRET2_VERSION${plain}"
@@ -1365,28 +1379,40 @@ version_select() {
 		fi
 	    # проверяем результаты по порядку
 		echo -e "${yellow}Поиск последней версии...${plain}"
-    	VER1=$(curl -sL $lastest_release | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+		# Один запрос с таймаутом (недоступный api.github.com не вешает установку),
+		# разные способы разбора — по сохранённому ответу
+		rel_json="$(curl -sL --max-time 15 "$lastest_release" 2>/dev/null || true)"
+    	VER1=$(printf '%s\n' "$rel_json" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
 		if [ ${#VER1} -ge 2 ]; then
 			VER="$VER1"
 			echo -e "${green}Выбрано: $VER (метод: sed -E)${plain}"
 		else
-			VER2=$(curl -sL $lastest_release | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+			VER2=$(printf '%s\n' "$rel_json" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
 			if [ ${#VER2} -ge 2 ]; then
 				VER="$VER2"
 				echo -e "${green}Выбрано: $VER (метод: grep+cut)${plain}"
 			else
-				VER3=$(curl -sL $lastest_release | grep '"tag_name":' | sed -r 's/.*"v([^"]+)".*/\1/')
+				VER3=$(printf '%s\n' "$rel_json" | grep '"tag_name":' | sed -r 's/.*"v([^"]+)".*/\1/')
 				if [ ${#VER3} -ge 2 ]; then
 					VER="$VER3"
 					echo -e "${green}Выбрано: $VER (метод: sed -r)${plain}"
 				else
-					VER4=$(curl -sL $lastest_release | grep '"tag_name":' | awk -F'"' '{print $4}' | sed 's/^v//')
+					VER4=$(printf '%s\n' "$rel_json" | grep '"tag_name":' | awk -F'"' '{print $4}' | sed 's/^v//')
 					if [ ${#VER4} -ge 2 ]; then
 						VER="$VER4"
 						echo -e "${green}Выбрано: $VER (метод: awk)${plain}"
 					else
-						echo -e "${yellow}Не удалось получить информацию о последней версии с GitHub. Будет использоваться версия $DEFAULT_VER.${plain}"
-						VER="$DEFAULT_VER"
+						# Фиксированной версии-заглушки нет: у форка и официальной сборки
+						# разные теги. Берём установленную, иначе — ручной ввод.
+						inst_ver="$(zapret2_version_short)"
+						inst_ver="${inst_ver#v}"
+						if z2r_version_valid "$inst_ver"; then
+							VER="$inst_ver"
+							echo -e "${yellow}Не удалось получить информацию о последней версии с GitHub. Будет использоваться установленная версия $VER.${plain}"
+						else
+							echo -e "${yellow}Не удалось получить информацию о последней версии с GitHub. Введите версию вручную.${plain}"
+							continue
+						fi
 					fi
 				fi
 			fi
@@ -1479,11 +1505,14 @@ z2r_archive_download_diagnose() {
  return 0
 }
 
-#Скачивание, распаковка архива zapret2, очистка от ненуных бинарей
+#Скачивание, распаковка архива zapret2, очистка от ненуных бинарей.
+#Только подготовка в $ZAPRET2_STAGE_DIR: текущая установка не трогается до
+#zapret_install_staged (после remove_zapret), сбой загрузки её не ломает.
+ZAPRET2_STAGE_DIR="/tmp/z2r_zapret2_$$"
 zapret_get() {
  local archive
  local extract_dir
- local workdir
+ local workdir="$ZAPRET2_STAGE_DIR"
  local zipmode=0
  if [[ "$OSystem" == "WRT" ]]; then
      tarfile="zapret2-v$VER-openwrt-embedded.tar.gz"
@@ -1535,7 +1564,6 @@ zapret_get() {
          return 1
      fi
  fi
- workdir="/tmp/z2r_zapret2_$$"
  rm -rf "$workdir"
  mkdir -p "$workdir"
  if [ "$zipmode" = 1 ]; then
@@ -1572,12 +1600,27 @@ zapret_get() {
      rm -rf "$workdir"
      return 1
  fi
- sh "$workdir/zapret2/install_bin.sh"
+ # Вызывается в условии if (set -e внутри не действует): сбои проверяем явно.
+ if ! sh "$workdir/zapret2/install_bin.sh"; then
+     echo -e "${red}install_bin.sh не подобрал бинарники zapret2 для этой платформы.${plain}"
+     rm -rf "$workdir"
+     return 1
+ fi
  find "$workdir/zapret2/binaries"/* -maxdepth 0 -type d ! -name "$(basename "$(dirname "$(readlink "$workdir/zapret2/nfq2/nfqws2")")")" -exec rm -rf {} +
  z2r_prune_staged_binaries "$workdir/zapret2"
  z2r_prune_staged_sources "$workdir/zapret2"
  rm -rf "$workdir/zapret2/docs"
  rm -f "$workdir/zapret2/files/fake"/*
+ if [ ! -x "$workdir/zapret2/nfq2/nfqws2" ]; then
+     echo -e "${red}После подготовки архива zapret2 не найден nfq2/nfqws2.${plain}"
+     rm -rf "$workdir"
+     return 1
+ fi
+}
+
+#Подмена zapret2-native подготовленным zapret_get деревом (после remove_zapret)
+zapret_install_staged() {
+ local workdir="$ZAPRET2_STAGE_DIR"
  # Заменяем только zapret2-native; zator-контент в $ZATOR_ROOT не затрагивается.
  rm -rf "$ZAPRET2_ROOT"
  mv "$workdir/zapret2" "$ZAPRET2_ROOT"
@@ -1656,7 +1699,7 @@ install_zapret_reboot() {
  cleanup_zapret2_init_dirs
  client_scope_firewall_apply_active_config
  z2r_service_action restart
- if pidof nfqws2 >/dev/null; then
+ if z2r_prod_nfqws2_running; then
   check_access_list
   echo -e "${green}zapret2 перезапущен и полностью установлен\n${yellow}Открываю меню управления. Если меню закрылось или что-то пошло не так — просто напишите 'z2r' в терминале. Саппорт: tg: zee4r${plain}"
  else
@@ -1669,7 +1712,7 @@ install_zapret_reboot() {
  if type backup_update_offer_restore >/dev/null 2>&1; then
    backup_update_offer_restore || true
  fi
- if ! pidof nfqws2 >/dev/null; then
+ if ! z2r_prod_nfqws2_running; then
   pause_enter
  fi
 }
@@ -2512,7 +2555,7 @@ ${green}Выберите необходимое действие:${yellow}
 ${Fcyan}0.${yellow} Выход
 ${Fcyan}01.${yellow} Проверить доступность сервисов (Тест не точен)
 ${Fcyan}1.${yellow} Фиксация стратегии профиля/безразборного блока. Текущие: ${plain}[ ${strategies_status} ]${yellow} (fallback TLS: ${plain}[$(fallback_strategy_text)]${yellow}, HTTP: ${plain}[$(fallback_http_strategy_text)]${yellow})
-${Fcyan}2.${yellow} Стоп/старт zapret2, ${Fcyan}22${yellow} - рестарт (сейчас: $(pidof nfqws2 >/dev/null && echo "${green}Запущен${yellow}" || echo "${red}Остановлен${yellow}"))
+${Fcyan}2.${yellow} Стоп/старт zapret2, ${Fcyan}22${yellow} - рестарт (сейчас: $(z2r_prod_nfqws2_running && echo "${green}Запущен${yellow}" || echo "${red}Остановлен${yellow}"))
 ${Fcyan}3.${yellow} Запуск blockcheck2 и сохранение SUMMARY
 ${Fcyan}4.${yellow} Удаление zator и zapret2, ${Fcyan} 44.${yellow} Удаление zapret2
 ${Fcyan}5.${yellow} Обновление zator и zapret2 (релизы, стратегии, листы)
@@ -2555,7 +2598,7 @@ ${Fcyan}777.${yellow} Активировать zeefeer premium (Нажимать
     ;;
 
   "2")
-    if pidof nfqws2 >/dev/null; then
+    if z2r_prod_nfqws2_running; then
       ensure_nfqws2_stopped
       echo -e "${green}Выполнена команда остановки zapret2${plain}"
     else
@@ -2578,7 +2621,8 @@ ${Fcyan}777.${yellow} Активировать zeefeer premium (Нажимать
     ;;
 
   "3")
-    blockcheck2_run_summary
+    # Ненулевой код blockcheck2 и прерванный Ctrl+C sleep не должны ронять меню (set -e)
+    blockcheck2_run_summary || true
     pause_enter
     ;;
 
@@ -2684,7 +2728,7 @@ ${Fcyan}777.${yellow} Активировать zeefeer premium (Нажимать
 
   "12")
     toggle_hostlist_mode
-    if pidof nfqws2 >/dev/null; then
+    if z2r_prod_nfqws2_running; then
       z2r_service_action restart
       echo -e "${green}zapret2 перезапущен для применения режима${plain}"
     fi
@@ -2693,7 +2737,7 @@ ${Fcyan}777.${yellow} Активировать zeefeer premium (Нажимать
 
   "13")
     toggle_fallback_mode
-    if pidof nfqws2 >/dev/null; then
+    if z2r_prod_nfqws2_running; then
       z2r_service_action restart
       echo -e "${green}zapret2 перезапущен для применения режима${plain}"
     fi
@@ -2717,7 +2761,7 @@ ${Fcyan}777.${yellow} Активировать zeefeer premium (Нажимать
     ;;
 
   "18")
-    if toggle_rst_guard_mode && pidof nfqws2 >/dev/null; then
+    if toggle_rst_guard_mode && z2r_prod_nfqws2_running; then
       z2r_service_action restart
       echo -e "${green}zapret2 перезапущен для применения RST-защиты${plain}"
     fi
@@ -2799,7 +2843,10 @@ else
     echo -e "${red}Не был получен доступ к api.github.com (таймаут 30 сек). Возможны проблемы при установке.${plain}"
 	if [ "$hardware" = "keenetic" ]; then
 		echo "Добавляем ip с от DNS 1.1.1.1 к api.github.com и пытаемся снова"
-		ndmc -c "ip host api.github.com $(nslookup api.github.com 1.1.1.1 | sed -n 's/^Address [0-9]*: \([0-9.]*\).*/\1/p' | tail -n1)"
+		# Оба формата busybox nslookup («Address 1: ip host» и «Address: ip»),
+		# адрес DNS-сервера в шапке (до Name:) пропускаем
+		gh_ip="$(nslookup api.github.com 1.1.1.1 2>/dev/null | awk '/^Name:/{a=1;next} a && /^Address/{for(i=2;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ip=$i} END{print ip}' || true)"
+		[ -n "$gh_ip" ] && ndmc -c "ip host api.github.com $gh_ip" || true
 		echo -e "${yellow}zeefeer обновлен (UTC +0): $(z2r_github_commit_date z2r.sh) ${plain}"
 	fi
 else
@@ -2841,7 +2888,26 @@ while true; do
  #Проверка наличия каталога opt и его создание при необходиомости (для некоторых роутеров), переход в tmp
  mkdir -p /opt
  cd /tmp
- 
+
+ #Запрос желаемой версии zapret2
+ if [ "${Z2R_OFFLINE:-0}" = "1" ]; then
+  echo -e "${yellow}Конфиг будет установлен из локального архива.${plain}"
+ else
+  echo -e "${yellow}Конфиг обновлен (UTC +0): $(z2r_github_commit_date config.default) ${plain}"
+ fi
+ zapret2_flavor_prompt
+ version_select
+
+ #Скачивание и распаковка архива zapret2 во временный каталог — ДО сноса
+ #текущей установки: без сети/архива рабочий zapret2 остаётся на месте.
+ if ! zapret_get; then
+  if [ -f "$ZAPRET2_ROOT/config" ]; then
+   echo -e "${yellow}Текущая установка zapret2 не тронута. Возвращаю в меню.${plain}"
+   get_menu; continue
+  fi
+  exit 1
+ fi
+
  if [ -f "$ZAPRET2_ROOT/config" ]; then
    backup_helper_ask_and_create
  fi
@@ -2851,19 +2917,8 @@ while true; do
 
  # Watchdog не трогаем: это переустановка (поднимем в конце — watchdog_ensure_running).
  remove_zapret
- 
- #Запрос желаемой версии zapret2
- if [ "${Z2R_OFFLINE:-0}" = "1" ]; then
-  echo -e "${yellow}Конфиг будет установлен из локального архива.${plain}"
- else
-  echo -e "${yellow}Конфиг обновлен (UTC +0): $(z2r_github_commit_date config.default) ${plain}"
- fi
- zapret2_flavor_prompt
- version_select
- 
- #Скачивание, распаковка архива zapret2 и его удаление
- zapret_get
- 
+ zapret_install_staged
+
  # Создаём папки и забираем файлы папок lists, fake, extra_strats, копируем конфиг, скрипты для войсов DS, WA, TG
   # Повторная установка (смена версии zapret2): zator-контент уже развёрнут и
   # от версии запрета не зависит — существующие файлы не перекачиваем
@@ -2891,7 +2946,7 @@ while true; do
    read -re -p $'\033[33mWeb-панель управления уже установлена. Обновить её файлы из репозитория? 1 - Да, Enter - нет\033[0m\n' webui_answer
    case "$webui_answer" in
      "1")
-       webui_install
+       webui_install || echo -e "${red}Web-панель не установилась — продолжаю установку zapret2 (повторить: п.14).${plain}"
      ;;
      *)
        echo "Пропуск обновления Web-панели (текущие файлы не тронуты)"
@@ -2901,7 +2956,7 @@ while true; do
    read -re -p $'\033[33mУстановить Web-панель управления (~3МБ места)? 1 - Да, Enter - нет\033[0m\n' webui_answer
    case "$webui_answer" in
      "1")
-       webui_install
+       webui_install || echo -e "${red}Web-панель не установилась — продолжаю установку zapret2 (повторить: п.14).${plain}"
      ;;
      *)
        echo "Пропуск установки Web-панели"

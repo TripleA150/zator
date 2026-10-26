@@ -169,9 +169,10 @@ send_stats() {
     elif command -v ndmc >/dev/null 2>&1 || grep -Eqi 'keenetic' /proc/version 2>/dev/null; then
         router_os="keenetic"
     elif [ -f /etc/os-release ]; then
-        router_os="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '\"' | tr '[:upper:]' '[:lower:]')"
+        # A-Z, а не [:upper:]: busybox tr без классов (OpenWrt) даёт «owenwrt»
+        router_os="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '\"' | tr 'A-Z' 'a-z')"
     elif [ -f /usr/lib/os-release ]; then
-        router_os="$(sed -n 's/^ID=//p' /usr/lib/os-release | head -n1 | tr -d '\"' | tr '[:upper:]' '[:lower:]')"
+        router_os="$(sed -n 's/^ID=//p' /usr/lib/os-release | head -n1 | tr -d '\"' | tr 'A-Z' 'a-z')"
     elif [ -f /opt/etc/entware_release ] || [ -f /etc/entware_release ]; then
         router_os="entware"
     fi
@@ -183,7 +184,7 @@ send_stats() {
     curl -sL --max-time 10 \
         -d "token=$STATS_TOKEN" \
         -d "uuid=$tel_uuid" \
-        -d "isp=$my_isp" \
+        --data-urlencode "isp=$my_isp" \
         -d "udp=$s_udp" \
         -d "tcp=$s_tcp" \
         -d "gv=$s_gv" \

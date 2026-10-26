@@ -167,8 +167,24 @@ new_tcp="$(config_get_var "$NEW" NFQWS2_PORTS_TCP)"
 new_udp="$(config_get_var "$NEW" NFQWS2_PORTS_UDP)"
 [ "$new_tcp" = "123,456,80,443,2053,2083,2087,2096,8443" ] \
   || fail "NFQWS2_PORTS_TCP не перенесён (got: $new_tcp)"
-[ "$new_udp" = "7777,1026-65531,443,2408" ] || fail "NFQWS2_PORTS_UDP не перенесён (got: $new_udp)"
+# Из старого берутся только пользовательские порты (слева от 443), база — из нового.
+[ "$new_udp" = "7777,1026-65531,$(config_get_var "$REPO_DIR/config.default" NFQWS2_PORTS_UDP)" ] \
+  || fail "NFQWS2_PORTS_UDP не перенесён (got: $new_udp)"
 ok "пользовательские TCP/UDP порты перенесены в новый config"
+
+# Легаси-бэкап без DNS-блока и без 53: дефолтный 53 нового релиза не теряется.
+LEG_OLD="$ENV/legacy_dns_old"; LEG_NEW="$ENV/legacy_dns_new"
+sed '/#Z2R_DNS_BEGIN/,/#Z2R_DNS_END/d' "$REPO_DIR/config.default" > "$LEG_OLD"
+config_set_var "$LEG_OLD" NFQWS2_PORTS_UDP "$(csv_remove_tokens "$(config_get_var "$LEG_OLD" NFQWS2_PORTS_UDP)" 53),1026-65531"
+cp "$REPO_DIR/config.default" "$LEG_NEW"
+backup_smart_apply_ports "$LEG_OLD" "$LEG_NEW"
+backup_smart_apply_flags "$LEG_OLD" "$LEG_NEW"
+[ "$(config_mode_text dns_desync "$LEG_NEW")" = "Включен" ] \
+  || fail "легаси-бэкап выключил антиспуф DNS (got: $(config_mode_text dns_desync "$LEG_NEW"))"
+csv_contains_token "$(config_get_var "$LEG_NEW" NFQWS2_PORTS_UDP)" 53 || fail "легаси-бэкап потерял порт 53"
+csv_contains_token "$(config_get_var "$LEG_NEW" NFQWS2_PORTS_UDP)" 1026-65531 \
+  || fail "игровой диапазон справа от базы не перенесён"
+ok "легаси-бэкап: 53 нового релиза сохранён, игровой диапазон перенесён"
 
 # Пользовательские TCP-порты должны попасть в --filter-tcp блока RKN.
 if sed -n '/#Стратегии для RKN/,/^[[:space:]]*--new[[:space:]]*$/p' "$NEW" \
@@ -355,8 +371,13 @@ ok "set_fallback: round-trip вкл↔выкл корректен"
 cp "$REPO_DIR/config.default" "$T"
 backup_smart_set_rst_guard "$T" 1
 [ "$(config_mode_text rst_guard "$T")" = "включен" ] || fail "set_rst_guard 1 не сработал"
+grep -q -- '--lua-desync=rst_guard_locked:key=10:' "$T" && fail "set_rst_guard 1 задел DNS-профиль key=10"
+# RST без payload — тип empty: без него в --payload профилей 1-4 guard RST не видит.
+rst_empty="$(sed -n '/#Z2R_AUTO_STANDARD_1_BEGIN/,/#Z2R_AUTO_STANDARD_1_END/p' "$T" | grep -c -- '^--payload=.*,empty$')"
+[ "$rst_empty" = 1 ] || fail "set_rst_guard 1 не добавил empty в --payload профиля 1"
 backup_smart_set_rst_guard "$T" 0
 [ "$(config_mode_text rst_guard "$T")" = "выключен" ] || fail "set_rst_guard 0 не сработал"
+cmp -s "$REPO_DIR/config.default" "$T" || fail "set_rst_guard: round-trip вкл↔выкл изменил config"
 ok "set_rst_guard: round-trip вкл↔выкл корректен"
 
 cp "$REPO_DIR/config.default" "$T"
@@ -392,6 +413,11 @@ menu_action_toggle_udp_range >/dev/null || fail "toggle: включение уп
 [ "$(config_mode_text udp_games "$T")" = "Включен" ] || fail "toggle: рассинхронный конфиг не вылечен включением"
 menu_action_toggle_udp_range >/dev/null || fail "toggle: выключение упало"
 [ "$(config_mode_text udp_games "$T")" = "Выключен" ] || fail "toggle: выключение не сработало"
+# Диапазон встаёт справа от якоря 443: слева он считался бы пользовательским портом.
+cp "$REPO_DIR/config.default" "$T"
+menu_action_toggle_udp_range >/dev/null || fail "toggle: включение на дефолте упало"
+ports_split "$(config_get_var "$T" NFQWS2_PORTS_UDP)" 443
+[ -z "$_PORTS_USER" ] || fail "toggle: 1026-65531 встал слева от 443 (user: $_PORTS_USER)"
 unset -f get_config_file
 ok "menu_action_toggle_udp_range: самовосстановление и полное переключение"
 
@@ -472,6 +498,36 @@ if { sed -n '/#Z2R_FALLBACK_BEGIN/,/#Z2R_FALLBACK_END/p' "$NEW3"
 else
   ok "идемпотентность: повторное применение флагов стабильно"
 fi
+
+# Полный сброс (п.5 -> 3) транзакционный: сбой get_repo возвращает листы, локи
+# и фейки; настройки extra_strats/cache (flavor) переживают и успешный сброс.
+RS="$TMP_DIR/reset"
+for rmode in fail ok; do
+  (
+    mkdir -p "$RS/zator/lists" "$RS/zator/extra_strats/cache/orchestra" "$RS/zator/files/fake" "$RS/zapret2"
+    echo user > "$RS/zator/lists/netrogat.txt"; echo dom > "$RS/zator/extra_strats/TCP_Custom.txt"
+    echo lock > "$RS/zator/extra_strats/cache/orchestra/locked.tsv"; echo old > "$RS/zator/files/fake/quic_3.bin"
+    echo fork > "$RS/zator/extra_strats/cache/zapret2_flavor"
+    eval "$(sed -n '/^menu_action_update_config_reset() {/,/^}/p' "$REPO_DIR/lib/actions.sh" \
+      | sed "s#/opt/zator#$RS/zator#g; s#/opt/zapret2#$RS/zapret2#g")"
+    z2r_service_action() { :; }; z2r_github_commit_date() { :; }
+    z2r_download_project_file() { :; }; config_apply_from_default() { :; }
+    get_repo() { mkdir -p "$RS/zator/lists"; echo new > "$RS/zator/lists/netrogat.txt"; [ "$rmode" = ok ]; }
+    menu_action_update_config_reset >/dev/null 2>&1
+  ); rc=$?
+  [ "$(cat "$RS/zator/extra_strats/cache/zapret2_flavor" 2>/dev/null)" = fork ] || fail "сброс ($rmode) удалил extra_strats/cache"
+  ls -d "$RS"/zator/.config_reset.* >/dev/null 2>&1 && fail "сброс ($rmode) оставил stash"
+  if [ "$rmode" = fail ]; then
+    [ "$rc" = 1 ] && [ "$(cat "$RS/zator/lists/netrogat.txt")" = user ] \
+      && [ -f "$RS/zator/extra_strats/TCP_Custom.txt" ] && [ -f "$RS/zator/extra_strats/cache/orchestra/locked.tsv" ] \
+      && [ -f "$RS/zator/files/fake/quic_3.bin" ] || fail "сбой get_repo: листы/локи/фейки не возвращены (rc=$rc)"
+  else
+    [ "$rc" = 0 ] && [ "$(cat "$RS/zator/lists/netrogat.txt")" = new ] \
+      && [ ! -e "$RS/zator/extra_strats/TCP_Custom.txt" ] && [ ! -e "$RS/zator/extra_strats/cache/orchestra/locked.tsv" ] \
+      && [ ! -e "$RS/zator/files/fake/quic_3.bin" ] || fail "успешный сброс не сбросил листы/локи/фейки (rc=$rc)"
+  fi
+done
+ok "полный сброс: откат при сбое get_repo, cache-настройки сохраняются"
 
 echo ""
 echo "============================="

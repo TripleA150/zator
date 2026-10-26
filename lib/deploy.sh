@@ -34,6 +34,16 @@ deploy_dest_for() {
   esac
 }
 
+# Allow-лист dest манифеста: только /opt/zator/* и /opt/z2r.sh. «*» в шаблоне
+# пропускает и ../, поэтому выход за корень отсекается первым.
+deploy_dest_ok() {
+  case "$1" in
+    */../*|*/..|*/./*) return 1 ;;
+    /opt/zator/*|/opt/z2r.sh) return 0 ;;
+  esac
+  return 1
+}
+
 # цвета и сеть определены в z2r.sh; при standalone-вызове даём минимум
 if [ -z "${yellow:-}" ]; then
   plain='' red='' green='' yellow='' Fyellow='' Fcyan='' Bred='' Fplain=''
@@ -216,11 +226,13 @@ deploy_check_latest() {
   local zator_sha webui_sha
   zator_sha="$(deploy_version_field ZATOR_SHA)"
   webui_sha="$(deploy_version_field WEBUI_SHA)"
-  [ -n "$zator_sha" ] && [ "$zator_sha" != "$DEPLOY_META_ZATOR_SHA" ] && DEPLOY_UPDATE_ZATOR=1
+  # пустой SHA (raw-установка, deploy_version_bootstrap) = версия неизвестна,
+  # значит не «актуально»: предлагаем поставить релиз
+  [ "$zator_sha" != "$DEPLOY_META_ZATOR_SHA" ] && DEPLOY_UPDATE_ZATOR=1
   # без установленной панели обновлять нечего: WEBUI_SHA в version.env
   # присутствует даже на core-установках (общая сборка)
   if [ -e "$ZATOR_ROOT/webui/run-webui.sh" ]; then
-    [ -n "$webui_sha" ] && [ "$webui_sha" != "$DEPLOY_META_WEBUI_SHA" ] && DEPLOY_UPDATE_WEBUI=1
+    [ "$webui_sha" != "$DEPLOY_META_WEBUI_SHA" ] && DEPLOY_UPDATE_WEBUI=1
   fi
   if [ "$DEPLOY_UPDATE_ZATOR" = 1 ] || [ "$DEPLOY_UPDATE_WEBUI" = 1 ]; then
     echo -e "${yellow}Есть обновление:${plain}"
@@ -420,9 +432,13 @@ EOF
 # сохранение манифеста, слияние version.env, шебанги webui, рестарт webui.
 deploy_post_apply() {
   local tree="$1" tracking="$2" z2r_updated="$3" webui_updated="$4"
-  local has_core=0 has_webui=0 name
-  if [ -e "$tree/_root/z2r.sh" ] || [ -d "$tree/z2r_lib" ]; then has_core=1; fi
-  if [ -e "$tree/webui/run-webui.sh" ]; then has_webui=1; fi
+  # 5/6 — состав архива (режим C: tree — только мета, детект по дереву невозможен)
+  local has_core="${5:-}" has_webui="${6:-}" name
+  if [ -z "$has_core" ]; then
+    has_core=0 has_webui=0
+    if [ -e "$tree/_root/z2r.sh" ] || [ -d "$tree/z2r_lib" ]; then has_core=1; fi
+    if [ -e "$tree/webui/run-webui.sh" ]; then has_webui=1; fi
+  fi
   case "$has_core$has_webui" in
     10) name=core ;;
     01) name=webui ;;
@@ -467,13 +483,10 @@ deploy_apply_staging() {
       return 1
       ;;
     esac
-    case "$dest" in
-      /opt/zator/*|/opt/z2r.sh) ;;
-      *)
-        echo -e "${red}Недопустимый dest в манифесте: $dest${plain}"
-        return 1
-        ;;
-    esac
+    if ! deploy_dest_ok "$dest"; then
+      echo -e "${red}Недопустимый dest в манифесте: $dest${plain}"
+      return 1
+    fi
     dest="$(deploy_dest_for "$dest")"
     if [ "$cls" = "keep-if-exists" ] && [ -e "$dest" ]; then
       kept=$((kept + 1))
@@ -516,6 +529,10 @@ deploy_carry_over_old() {
   local rel cls
   (cd "$old" 2>/dev/null && find . \( -type f -o -type l \) 2>/dev/null) | sed 's#^./##' | while read -r rel; do
     [ -n "$rel" ] || continue
+    case "$rel" in
+      # мета архива от прошлого режима C устарела; живой version.env переносится
+      extra_strats/cache/deploy/manifest.tsv|extra_strats/cache/deploy/manifest.json) continue ;;
+    esac
     cls="$(awk -F'|' -v p="$rel" '$1 == p {print $3; exit}' "$manifest")"
     if [ -n "$cls" ] && [ "$cls" != "keep-if-exists" ]; then
       continue
@@ -536,8 +553,8 @@ deploy_carry_over_old() {
 
 # Режим C: <newdir> — распакованное дерево рядом с $ZATOR_ROOT.
 deploy_apply_newdir() {
-  local newdir="$1" tracking="$2" fresh="$3"
-  local z2r_updated=0 webui_updated=0 olddir="${ZATOR_ROOT}.old.$$"
+  local newdir="$1" tracking="$2"
+  local z2r_updated=0 webui_updated=0 olddir="${ZATOR_ROOT}.old.$$" metadir="${newdir}.meta"
   # ядро ли принёс этот архив — считаем ДО переноса: после mv дерево смешано
   # с перенесёнными файлами старой установки, z2r_lib есть даже при webui-only
   # (см. guard в deploy_apply_staging)
@@ -549,9 +566,18 @@ deploy_apply_newdir() {
     z2r_updated=1
   fi
   if [ -e "$newdir/webui/run-webui.sh" ]; then webui_updated=1; fi
+  # мета архива (version.env, manifest.*) — в сторону ДО переноса: перенос
+  # старого дерева затёр бы её живыми копиями (версия не продвигалась).
+  # Живой version.env переносится как обычно — источник слияния компонентов.
+  # metadir убирает EXIT-ловушка deploy_from_tar.
+  rm -rf "$metadir"
+  mkdir -p "$metadir/extra_strats/cache" || return 1
+  mv -f "$newdir/extra_strats/cache/deploy" "$metadir/extra_strats/cache/deploy" || return 1
 
+  # любой существующий каталог (даже без z2r_lib: остатки прерванной установки)
+  # отодвигается — иначе mv положил бы новое дерево ВНУТРЬ него
   local had_old=0
-  if [ "$fresh" != 1 ] && [ -d "$ZATOR_ROOT" ]; then
+  if [ -d "$ZATOR_ROOT" ]; then
     had_old=1
     mv -f "$ZATOR_ROOT" "$olddir" || return 1
   fi
@@ -562,7 +588,7 @@ deploy_apply_newdir() {
   fi
   if [ "$had_old" = 1 ]; then
     # старое дерево (уже переименованное) наполняло новое hardlink'ами
-    deploy_carry_over_old "$olddir" "$ZATOR_ROOT" "$ZATOR_ROOT/$DEPLOY_MANIFEST_REL"
+    deploy_carry_over_old "$olddir" "$ZATOR_ROOT" "$metadir/$DEPLOY_MANIFEST_REL"
     rm -rf "$olddir"
   fi
   if [ -d "$ZATOR_ROOT/_payload" ]; then
@@ -573,7 +599,7 @@ deploy_apply_newdir() {
     rm -rf "$ZATOR_ROOT/webui/www/cgi-bin"
     ln -sfn ../cgi-bin "$ZATOR_ROOT/webui/www/cgi-bin" 2>/dev/null || true
   fi
-  deploy_post_apply "$ZATOR_ROOT" "$tracking" "$z2r_updated" "$webui_updated"
+  deploy_post_apply "$metadir" "$tracking" "$z2r_updated" "$webui_updated" "$has_core" "$webui_updated"
   type fake_files_refresh >/dev/null 2>&1 && fake_files_refresh
   if [ "$has_core" = 1 ]; then
     deploy_apply_config_default || true
@@ -679,8 +705,8 @@ deploy_from_tar() {
   source="$1" variant="${2:-}" tag="${3:-latest}" tracking="${3:-}"
   tmpbase="/tmp/z2r_deploy_$$"
   staging="$tmpbase/stage" newdir="$ZATOR_ROOT.deploy.new.$$"
-  archive="" archive_kb="" unpacked_kb="" unpacked_bytes="" fresh=0 url="" meta_key=""
-  trap 'rm -rf "$tmpbase" "$newdir"' EXIT
+  archive="" archive_kb="" unpacked_kb="" unpacked_bytes="" url="" meta_key=""
+  trap 'rm -rf "$tmpbase" "$newdir" "$newdir.meta"' EXIT
 
   case "$source" in
     http://*|https://*)
@@ -719,10 +745,13 @@ deploy_from_tar() {
   if [ -z "$unpacked_bytes" ]; then
     unpacked_bytes="$(gzip -l "$archive" 2>/dev/null | awk 'NR==2 {print $2}')"
   fi
+  # busybox gzip без -l (OpenWrt): считаем распакованный поток целиком
+  if [ -z "$unpacked_bytes" ]; then
+    unpacked_bytes="$(gzip -dc "$archive" 2>/dev/null | wc -c | tr -d ' ')"
+  fi
   archive_kb="$(( ($(wc -c < "$archive") + 1023) / 1024))"
   unpacked_kb="$(( ${unpacked_bytes:-0} / 1024 + 1 ))"
 
-  [ -d "$ZATOR_ROOT/z2r_lib" ] || fresh=1
   deploy_space_mode_select "$archive_kb" "$unpacked_kb" || exit 1
 
   if [ "$DEPLOY_MODE" = "C" ]; then
@@ -732,7 +761,7 @@ deploy_from_tar() {
       deploy_unpack "$archive" "$newdir" || { rm -rf "$newdir"; exit 1; }
     fi
     deploy_verify_staging "$newdir" || { rm -rf "$newdir"; exit 1; }
-    deploy_apply_newdir "$newdir" "$tracking" "$fresh" || { rm -rf "$newdir"; exit 1; }
+    deploy_apply_newdir "$newdir" "$tracking" || { rm -rf "$newdir"; exit 1; }
     exit 0
   fi
 
@@ -750,7 +779,7 @@ deploy_from_tar() {
     exit 1
   fi
   if [ "$DEPLOY_MODE" = "C" ]; then
-    deploy_apply_newdir "$staging" "$tracking" "$fresh" || { rm -rf "$staging"; exit 1; }
+    deploy_apply_newdir "$staging" "$tracking" || { rm -rf "$staging"; exit 1; }
   else
     deploy_apply_staging "$staging" "$tracking" || { rm -rf "$staging"; exit 1; }
   fi
@@ -766,14 +795,11 @@ deploy_integrity_check() {
     [ -f "$m" ] || continue
     while IFS='|' read -r path dest cls sha size exec; do
       case "$path" in ''|'#'*) continue ;; esac
-      case "$dest" in
-        /opt/zator/*|/opt/z2r.sh) ;;
-        *)
-          echo -e "${red}недопустимый dest в манифесте: $dest${plain}"
-          missing=$((missing + 1))
-          continue
-          ;;
-      esac
+      if ! deploy_dest_ok "$dest"; then
+        echo -e "${red}недопустимый dest в манифесте: $dest${plain}"
+        missing=$((missing + 1))
+        continue
+      fi
       dest="$(deploy_dest_for "$dest")"
       total=$((total + 1))
       if [ ! -f "$dest" ]; then
@@ -959,18 +985,18 @@ deploy_reset_user_files() {
   while IFS='|' read -r path dest cls sha size exec; do
     case "$path" in ''|'#'*) continue ;; esac
     [ "$cls" = "keep-if-exists" ] || continue
+    # генерируемое состояние client scopes, не пользовательский лист: сброс
+    # выключил бы скоупы в Lua при включённом режиме в config
+    [ "$path" = "lua/client-scope-config.lua" ] && continue
     case "$path" in /*|../*|*/../*|*/..)
       echo -e "${red}Недопустимый путь в манифесте: $path${plain}"
       exit 1
       ;;
     esac
-    case "$dest" in
-      /opt/zator/*|/opt/z2r.sh) ;;
-      *)
-        echo -e "${red}Недопустимый dest в манифесте: $dest${plain}"
-        exit 1
-        ;;
-    esac
+    if ! deploy_dest_ok "$dest"; then
+      echo -e "${red}Недопустимый dest в манифесте: $dest${plain}"
+      exit 1
+    fi
     dest="$(deploy_dest_for "$dest")"
     if [ -f "$dest" ] && [ "$(file_sha256 "$dest")" != "$sha" ]; then
       idx=$((idx + 1))
@@ -1047,10 +1073,11 @@ deploy_menu_header() {
   wsha="$(deploy_version_field WEBUI_SHA)"
   lz="$(deploy_latest_field LATEST_ZATOR_SHA)"
   lw="$(deploy_latest_field LATEST_WEBUI_SHA)"
-  if [ -n "$lz" ] && [ -n "$zsha" ] && [ "$zsha" != "$lz" ]; then
+  # пустой локальный SHA = версия неизвестна (как в deploy_check_latest)
+  if [ -n "$lz" ] && [ "$zsha" != "$lz" ]; then
     what="zator от $(deploy_latest_field LATEST_ZATOR_DATE)"
   fi
-  if [ "$has_webui" = 1 ] && [ -n "$lw" ] && [ -n "$wsha" ] && [ "$wsha" != "$lw" ]; then
+  if [ "$has_webui" = 1 ] && [ -n "$lw" ] && [ "$wsha" != "$lw" ]; then
     [ -n "$what" ] && what="$what, "
     what="${what}Web-панель от $(deploy_latest_field LATEST_WEBUI_DATE)"
   fi
@@ -1071,6 +1098,19 @@ deploy_menu_header() {
 "
   fi
   return 0
+}
+
+# Установка latest при закреплённой версии снимает закрепление: спросить.
+# rc=0 — можно ставить latest, rc=1 — отмена.
+deploy_confirm_unpin() {
+  local tracked pin_answer
+  tracked="$(deploy_version_field TRACKING)"
+  case "$tracked" in ''|latest) return 0 ;; esac
+  echo -e "${yellow}Закреплена версия ${tracked}; обновление до latest снимет закрепление.${plain}"
+  read -re -p "1 - продолжить, 0 - отмена: " pin_answer
+  [ "$pin_answer" = "1" ] && return 0
+  echo -e "${yellow}Отменено.${plain}"
+  return 1
 }
 
 deploy_update_menu() {
@@ -1108,14 +1148,9 @@ deploy_update_menu() {
         fi
         variant="$(deploy_pick_variant)"
         if [ "$DEPLOY_UPDATE_ZATOR" = "1" ]; then
-          if [ "$(deploy_version_field TRACKING)" != "latest" ]; then
-            echo -e "${yellow}Закреплена версия $(deploy_version_field TRACKING); обновление до latest снимет закрепление.${plain}"
-            read -re -p "1 - продолжить, 0 - отмена: " pin_answer
-            if [ "$pin_answer" != "1" ]; then
-              echo -e "${yellow}Отменено.${plain}"
-              pause_enter
-              continue
-            fi
+          if ! deploy_confirm_unpin; then
+            pause_enter
+            continue
           fi
           deploy_from_tar "$(deploy_releases_base)/latest/zator-${variant}.tar.gz" "$variant" latest || true
         elif [ "$DEPLOY_UPDATE_WEBUI" = "1" ]; then
@@ -1129,7 +1164,8 @@ deploy_update_menu() {
         if [ ! -e "$ZATOR_ROOT/webui/run-webui.sh" ]; then
           echo -e "${yellow}Web-панель не установлена (п.14 главного меню).${plain}"
         elif deploy_check_latest && [ "$DEPLOY_UPDATE_WEBUI" = "1" ]; then
-          deploy_from_tar "$(deploy_releases_base)/latest/zator-webui.tar.gz" webui latest || true
+          # только панель: пустой tracking сохраняет закрепление ядра (TRACKING)
+          deploy_from_tar "$(deploy_releases_base)/latest/zator-webui.tar.gz" webui "" || true
         else
           echo -e "${green}Web-панель актуальна.${plain}"
         fi
@@ -1312,7 +1348,10 @@ deploy_transition_menu() {
         pause_enter
         ;;
       2)
-        deploy_from_tar "$(deploy_releases_base)/latest/zator-$(deploy_pick_variant).tar.gz" "$(deploy_pick_variant)" "" || true
+        # качается latest: при закреплении — тот же вопрос, что в п.2 меню 5
+        if deploy_confirm_unpin; then
+          deploy_from_tar "$(deploy_releases_base)/latest/zator-$(deploy_pick_variant).tar.gz" "$(deploy_pick_variant)" latest || true
+        fi
         pause_enter
         ;;
       3)

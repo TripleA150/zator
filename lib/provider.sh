@@ -132,6 +132,8 @@ _detect_api_simple() {
   resp="$(curl -s --connect-timeout 4 --max-time 6 'https://ipwho.is/' 2>/dev/null)"
   if printf '%s' "$resp" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
     asn="$(_provider_json_num "$resp" asn)"
+    # "asn":0 — ipwho.is не знает префикс: спрашиваем ipinfo/ip-api дальше
+    [ "$asn" = 0 ] && asn=""
     isp="$(_provider_clean "$(_provider_json_str "$resp" isp)")"
     city="$(_provider_clean "$(_provider_json_str "$resp" city)")"
   fi
