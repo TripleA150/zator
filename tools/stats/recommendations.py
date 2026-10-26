@@ -1,8 +1,8 @@
 """Anonymous provider recommendations from retained complete supersweeps."""
 from collections import Counter
-from fractions import Fraction
 from pathlib import Path
 import json
+import math
 import re
 import secrets
 import threading
@@ -13,6 +13,9 @@ WORKERS = (("yt", 1), ("gv", 2), ("rkn", 3), ("ds", 4))
 CACHE_KEY = "z4r:recommendations:v1:all"
 LOCK_KEY = CACHE_KEY + ":lock"
 REFRESH_LOCK = threading.Lock()
+# Wilson 95%: 1/1 зелёный не обгоняет 47/50; стратегия из одного-двух UUID в топ не идёт.
+WILSON_Z = 1.96
+MIN_STRATEGY_UUIDS = 3
 
 
 def validate_provider(provider):
@@ -95,6 +98,13 @@ def completed(run):
     return profiles
 
 
+def wilson_lower(ok, total, z=WILSON_Z):
+    if not total:
+        return 0.0
+    p, z2 = ok / total, z * z
+    return (p + z2 / (2 * total) - z * math.sqrt(p * (1 - p) / total + z2 / (4 * total * total))) / (1 + z2 / total)
+
+
 def percent(ok, total):
     return f"{100 * ok / total:.6f}".rstrip("0").rstrip(".") if total else "-"
 
@@ -157,9 +167,12 @@ def aggregate(runs, generated_at=0, aliases=None):
                 evidence[mode] = (ok, total, count)
             classic, clone = evidence["classic"], evidence["clone"]
             recommend = (item["samples"] >= 10 and classic[2] >= 3 and clone[2] >= 3
-                         and clone[0] * classic[1] > classic[0] * clone[1])
-            ranked = sorted((s for s in cells if cells[s]["ok"]), key=lambda s: (
-                -Fraction(cells[s]["ok"], cells[s]["total"]), -len(cells[s]["uuids"]), s))[:3]
+                         and clone[0] * classic[1] > classic[0] * clone[1]
+                         # Сырое сравнение оставлено: роутер требует clone% > classic% при hint=1.
+                         and wilson_lower(*clone[:2]) > wilson_lower(*classic[:2]))
+            ranked = sorted((s for s in cells if cells[s]["ok"] and len(cells[s]["uuids"]) >= MIN_STRATEGY_UUIDS),
+                            key=lambda s: (-wilson_lower(cells[s]["ok"], cells[s]["total"]),
+                                           -len(cells[s]["uuids"]), s))[:3]
             strategies = [[s, percent(cells[s]["ok"], cells[s]["total"]), len(cells[s]["uuids"]),
                            next(iter(cells[s]["modes"])) if len(cells[s]["modes"]) == 1 else "mixed"]
                           for s in ranked] if item["samples"] >= 10 else []
