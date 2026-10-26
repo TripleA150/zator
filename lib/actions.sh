@@ -73,7 +73,7 @@ config_apply_from_default() {
   # Раскомменчивание юзера под keenetic или merlin
   change_user
   # На Keenetic автоматически подставляем WAN интерфейс в свежий шаблон конфига.
-  if [ "$hardware" = "keenetic" ]; then
+  if [ "${hardware:-}" = "keenetic" ]; then
     config_keenetic_set_wan_iface "$root/config.default"
   fi
 
@@ -82,14 +82,14 @@ config_apply_from_default() {
   cp -f "$root/config.default" "$root/config"
   if [ -f "$old_scope_cfg" ]; then
     config_client_scope_apply "$old_scope_cfg" "$root/config" || true
-    [ "$hardware" = "keenetic" ] && { config_keenetic_policy_apply "$old_scope_cfg" "$root/config" || true; }
+    [ "${hardware:-}" = "keenetic" ] && { config_keenetic_policy_apply "$old_scope_cfg" "$root/config" || true; }
     rm -f "$old_scope_cfg"
   fi
   config_client_scope_ensure "$root/config" || true
   client_scope_lua_config_sync "$root/config" || true
-  [ "$hardware" = "keenetic" ] && ensure_keenetic_policy_config "$root/config"
+  [ "${hardware:-}" = "keenetic" ] && ensure_keenetic_policy_config "$root/config"
   # После копирования заново подставляем WAN, чтобы перенос не терял IFACE_WAN.
-  if [ "$hardware" = "keenetic" ]; then
+  if [ "${hardware:-}" = "keenetic" ]; then
     config_keenetic_set_wan_iface "$root/config"
   fi
   return 0
@@ -1577,7 +1577,7 @@ backup_smart_apply_flags() {
   config_client_scope_apply "$old_cfg" "$new_cfg"
 
   # Keenetic-политика (POLICY_NAME/MARK/EXCLUDE) + хуки firewall.
-  if [ "$hardware" = "keenetic" ]; then
+  if [ "${hardware:-}" = "keenetic" ]; then
     config_keenetic_policy_apply "$old_cfg" "$new_cfg"
     ensure_keenetic_policy_config "$new_cfg"
   fi
@@ -1801,7 +1801,7 @@ menu_action_backup_restore() {
   if [ "$mode" = "1" ]; then
     if [ -f "$restore_dir/config" ]; then
       if cp -f "$restore_dir/config" /opt/zapret2/config; then
-        [ "$hardware" = "keenetic" ] && ensure_keenetic_policy_config /opt/zapret2/config
+        [ "${hardware:-}" = "keenetic" ] && ensure_keenetic_policy_config /opt/zapret2/config
         echo -e "${green}config восстановлен.${plain}"
       else
         rm -rf "$restore_dir"

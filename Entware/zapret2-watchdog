@@ -274,7 +274,8 @@ case "$1" in
 		fi
 		rm -f "$PIDFILE"
 		mkdir -p "$(dirname "$PIDFILE")" || exit 1
-		nohup "$0" watch >>"$LOGFILE" 2>&1 &
+		# через sh: скрипт без бита +x (перекачан/распакован с 0644) тоже стартует
+		nohup sh "$0" watch >>"$LOGFILE" 2>&1 &
 		child=$!
 		# pidfile пишет сам демон (echo $$ в do_watch) — его появление и есть
 		# сигнал готовности. Раньше start вслепую рапортовал успех: демон мог

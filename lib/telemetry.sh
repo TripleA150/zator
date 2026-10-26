@@ -41,7 +41,8 @@ init_telemetry() {
         read -p "Разрешить? (Enter - да, n - нет): " stats_yn
 
         case "$stats_yn" in
-            [NnНн]*) tel_enabled="0" ;;
+            # Кириллица отдельными альтернативами: в C-локали [Нн] — набор байт и ловит «да».
+            [Nn]*|Н*|н*) tel_enabled="0" ;;
             *)       tel_enabled="1" ;;
         esac
 
