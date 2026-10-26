@@ -1,0 +1,42 @@
+# Desync-функции upstream zapret2 (function NAME(ctx, desync)) из lua/zapret-lib.lua,
+# lua/zapret-antidpi.lua, lua/zapret-auto.lua: bol-van/zapret2 master, 2026-10-26.
+# Форк MarkinAlexander/zapret2 (сборка по умолчанию) даёт тот же набор.
+# Пересобрать: grep -hoE '^function [A-Za-z_][A-Za-z0-9_]*\(ctx, ?desync\)' lua/zapret-*.lua
+argdebug
+circular
+condition
+desync_orchestrator_example
+detect_payload_str
+dht_dn
+drop
+fake
+fakeddisorder
+fakedsplit
+hostfakesplit
+http_domcase
+http_hostcase
+http_methodeol
+http_unixeol
+luaexec
+multidisorder
+multidisorder_legacy
+multisplit
+oob
+orchestrate
+pass
+per_instance_condition
+pktdebug
+pktmod
+posdebug
+repeater
+rst
+send
+stopif
+synack
+synack_split
+syndata
+tcpseg
+tls_client_hello_clone
+udplen
+wsize
+wssize

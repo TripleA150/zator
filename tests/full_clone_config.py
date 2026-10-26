@@ -8,7 +8,7 @@ for block in ('Z2R_AUTO_STANDARD_4', 'Z2R_AUTO_4'):
     strategy = next(line for line in text.splitlines() if line.startswith('--lua-desync=') and ':strategy=4 ' in line)
     assert '--lua-desync=multidisorder:blob=' in strategy, (block, 'fake must be sent tail first')
     assert ':pos=2,600,1200:nodrop:strategy=4 ' in strategy, (block, 'full clone segmentation missing')
-    assert '--lua-desync=fakeddisorder:pos=sniext+4:tcp_ts=-1000:strategy=4' in strategy
+    assert '--lua-desync=fakeddisorder:pos=sniext+4:tcp_md5:strategy=4' in strategy
 assert '--lua-desync=multidisorder:blob=clone_hcaptcha:tcp_md5:pos=2,600,1200:nodrop:strategy=36' in config
 # Игровой UDP: payload unknown, без payload=all fake/udplen молча ничего не шлют.
 game = config.split('#Стратегии для игрового UDP', 1)[1].split('\n--new', 1)[0]
