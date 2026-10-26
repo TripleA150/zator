@@ -176,6 +176,17 @@ G.slm_should_lock = function() lock_checks = lock_checks + 1 return false end
 G.automate_failure_counter_reset = function() reset_calls = reset_calls + 1 end
 G.automate_failure_counter = function() failure_counter_calls = failure_counter_calls + 1 return false end
 G.plan_instance_pop = function() return nil end
+-- Сид/порядок ротации проверяются в tests/slm_seed_rotation.lua; здесь — линейный
+-- перебор поверх замоканного slm_is_blocked, как до их появления.
+G.slm_seed_strategy = function() return 1, "default" end
+G.slm_rotation_next = function(askey, _, cur, ct, _, hostkey)
+    local s = cur
+    for _ = 1, ct do
+        s = (s % ct) + 1
+        if not G.slm_is_blocked(askey, hostkey, s) then return s end
+    end
+    return cur
+end
 G.test_provisional_failure = function() return mock_failure end
 G.test_provisional_success = function(_, crec)
     crec.provisional_success = true

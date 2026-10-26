@@ -14,7 +14,8 @@ done
 
 if [ -n "$lua_bin" ]; then
   for t in tests/client_scope.lua tests/client_scope_learning.lua tests/full_clone.lua \
-           tests/provisional_tcp_success.lua tests/slm_auto_locked_backup.lua; do
+           tests/provisional_tcp_success.lua tests/slm_auto_locked_backup.lua \
+           tests/locked_reload.lua tests/slm_seed_rotation.lua; do
     [ -f "$t" ] || continue
     if ! "$lua_bin" "$t" >/dev/null 2>&1; then
       echo "FAIL: $t"; "$lua_bin" "$t" 2>&1 | tail -5; fail=1

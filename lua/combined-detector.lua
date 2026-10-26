@@ -1294,12 +1294,7 @@ local function validator_poll(hrec, desync, hostkey)
         DLOG("circular_quality: validator FAIL " .. hostkey .. " strategy " .. strategy)
         slm_reset(slm_askey, hostkey, scope)
         slm_preload_blocked(slm_askey, hostkey, { strategy }, scope)
-        local next_strategy = strategy
-        for _ = 1, hrec.ctstrategy do
-            next_strategy = (next_strategy % hrec.ctstrategy) + 1
-            if not slm_is_blocked(slm_askey, hostkey, next_strategy, scope) then break end
-        end
-        hrec.nstrategy = next_strategy
+        hrec.nstrategy = slm_rotation_next(slm_askey, scope, strategy, hrec.ctstrategy, hrec, hostkey)
     else
         DLOG("circular_quality: validator " .. status .. " id=" .. id .. ", retry allowed")
     end
@@ -1465,8 +1460,11 @@ function circular_quality(ctx, desync)
     local skip_pass = false
 
     if not hrec.nstrategy then
-        DLOG("circular_quality: start from strategy 1")
-        hrec.nstrategy = 1
+        -- Новый хост: профильный лок -> стратегия автозалоченных соседей -> 1.
+        local proto = type(desync_lock_proto) == "function" and desync_lock_proto(desync) or "tls"
+        local seed, why = slm_seed_strategy(desync.arg.key, scope, hrec.ctstrategy, proto, hostkey)
+        DLOG("circular_quality: start from strategy " .. seed .. " (" .. tostring(why) .. ")")
+        hrec.nstrategy = seed
     end
 
     local validator_enabled = validator_path(desync.arg.validator) ~= nil
@@ -1504,15 +1502,9 @@ function circular_quality(ctx, desync)
         -- BLOCKED: If locked strategy is marked as blocked by user, reset and re-learn
         if slm_is_blocked(desync.arg.key, hostkey, locked, scope) then
             DLOG("circular_quality: BLOCKED " .. (hostkey or "?") .. " -> locked=" .. locked .. " is blocked, resetting")
-            -- Find next non-blocked strategy
-            local next_strat = locked
-            for i = 1, hrec.ctstrategy do
-                next_strat = (next_strat % hrec.ctstrategy) + 1
-                if not slm_is_blocked(desync.arg.key, hostkey, next_strat, scope) then
-                    break
-                end
-            end
-            hrec.nstrategy = next_strat
+            -- Find next non-blocked strategy (новый цикл обучения)
+            hrec.slm_tried = nil
+            hrec.nstrategy = slm_rotation_next(desync.arg.key, scope, locked, hrec.ctstrategy, hrec, hostkey)
             -- Reset quality tracking so it can find a better strategy
             slm_reset(desync.arg.key, hostkey, scope)
         else
@@ -1550,7 +1542,8 @@ function circular_quality(ctx, desync)
                         slm_reset(desync.arg.key, hostkey, scope)  -- This clears locked_strategy
                         hrec.locked_fail_count = 0
                         -- Start from next strategy (skip the failing one initially)
-                        hrec.nstrategy = (locked % hrec.ctstrategy) + 1
+                        hrec.slm_tried = nil
+                        hrec.nstrategy = slm_rotation_next(desync.arg.key, scope, locked, hrec.ctstrategy, hrec, hostkey)
                     end
                 end
 
@@ -1612,17 +1605,8 @@ function circular_quality(ctx, desync)
                     -- rotate again, and a pending validation pins the candidate.
                     DLOG("circular_quality: FAIL of strat " .. cstrat .. " not counted for rotation (current " .. hrec.nstrategy .. ")")
                 elseif automate_failure_counter(hrec, crec, fails, maxtime) then
-                    -- Rotate to next strategy, skipping blocked ones
-                    local start_strat = hrec.nstrategy
-                    repeat
-                        hrec.nstrategy = (hrec.nstrategy % hrec.ctstrategy) + 1
-                        -- Skip blocked strategies for this client scope
-                        if slm_is_blocked(desync.arg.key, hostkey, hrec.nstrategy, scope) then
-                            DLOG("circular_quality: skipping BLOCKED strategy " .. hrec.nstrategy)
-                        else
-                            break
-                        end
-                    until hrec.nstrategy == start_strat  -- Prevent infinite loop
+                    -- Rotate: популярные у соседей -> остальные, без BLOCKED и уже провалившихся
+                    hrec.nstrategy = slm_rotation_next(desync.arg.key, scope, hrec.nstrategy, hrec.ctstrategy, hrec, hostkey)
                     DLOG("circular_quality: rotate to strategy " .. hrec.nstrategy .. " [" .. slm_get_stats(desync.arg.key, hostkey, scope) .. "]")
                 end
             end

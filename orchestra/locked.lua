@@ -229,10 +229,44 @@ local function load_clone_size_file(path)
   f:close()
 end
 
-local function load_locked_tables()
+-- Детект смены lock-файлов внутри TTL: писатели (sweep, supersweep, WebUI)
+-- заменяют файл через mv, поэтому меняются inode/mtime/size. stat() есть не
+-- во всех сборках nfqws2 — без него остаётся прежний TTL (как у substring-листов).
+local LOCK_FILE_SIGS = {}
+
+local function lock_file_changed(slot, path)
+  local st = stat(path)
+  local old = LOCK_FILE_SIGS[slot]
+  if not st then
+    LOCK_FILE_SIGS[slot] = false
+    return old ~= false
+  end
+  if old and old.mtime == st.mtime and old.size == st.size and old.inode == st.inode then
+    return false
+  end
+  LOCK_FILE_SIGS[slot] = st
+  return true
+end
+
+-- Ровно два stat(): основной и ручной lock-файлы. Override/scoped-файлы
+-- пишутся меню, а не автопрогонами, — им хватает TTL.
+local function lock_files_changed()
+  if LOCKED_TEST_LINES or type(stat) ~= "function" then return false end
+  local main = lock_file_changed(1, LOCKED_PATH)
+  local manual = lock_file_changed(2, LOCKED_MANUAL_PATH)
+  return main or manual
+end
+
+-- check_files: сверять stat внутри TTL (circular_locked — раз на соединение).
+local function load_locked_tables(check_files)
   local now = os.time()
   -- now < last_load: часы шагнули назад (NTP после загрузки) — перечитываем
-  if now and now >= last_load and (now - last_load) < cache_ttl then return end
+  if now and now >= last_load and (now - last_load) < cache_ttl then
+    if not check_files or not lock_files_changed() then return end
+  else
+    -- запоминаем подписи до чтения: замена между stat и чтением даст ещё одну перезагрузку
+    lock_files_changed()
+  end
   last_load = now or 0
   LOCKED_TLS = {}
   LOCKED_HTTP = {}
@@ -258,12 +292,13 @@ local function load_locked_tables()
   end
 end
 
-function locked_strategy_for_profile(profile, proto, scope)
+-- Поиск по уже загруженным таблицам (без перезагрузки): circular_locked
+-- проверяет файлы один раз и затем делает несколько поисков (родители, профиль).
+local function locked_lookup(profile, proto, scope)
   if not profile then return nil end
   profile = string.lower(tostring(profile))
   proto = string.lower(tostring(proto or "tls"))
   scope = string.lower(tostring(scope or "default"))
-  load_locked_tables()
   local values = lock_table(proto)
   local function lookup(candidate)
     local conflicts = LOCKED_CONFLICTS[candidate]
@@ -273,6 +308,12 @@ function locked_strategy_for_profile(profile, proto, scope)
   local result, conflict = lookup(scope)
   if result ~= nil or conflict or scope == "default" then return result end
   return lookup("default")
+end
+
+function locked_strategy_for_profile(profile, proto, scope)
+  if not profile then return nil end
+  load_locked_tables(true)
+  return locked_lookup(profile, proto, scope)
 end
 
 function locked_strategy_for_scope(scope, profile, proto)
@@ -589,6 +630,8 @@ local function desync_proto(desync)
   end
   return "tls"
 end
+-- Тот же выбор proto для сида авторотации (slm_seed_strategy в combined-detector).
+desync_lock_proto = desync_proto
 
 function desync_allow_nohost(desync)
   local allow_nohost = desync.arg and desync.arg.allow_nohost
@@ -1117,20 +1160,25 @@ function circular_locked(ctx, desync)
   end
 
   local scope = desync_client_scope(desync)
-  local locked = locked_strategy_for_profile(profile, proto, scope)
+  -- stat lock-файлов — только на первом вызове соединения (UDP-профили зовут
+  -- circular_locked на каждый пакет in-range); дальше работает обычный TTL.
+  local lua_state = desync.track and desync.track.lua_state
+  load_locked_tables(not (lua_state and lua_state.z2r_locks_checked))
+  if lua_state then lua_state.z2r_locks_checked = true end
+  local locked = locked_lookup(profile, proto, scope)
   -- Доменный лок действует и на поддомены (как хостлист): www.example.com
   -- берёт строку example.com; ближайшая строка выигрывает, TLD и IP не ищем.
   local parent = profile ~= base_profile and not string.match(profile, "^[%d.]+$")
     and string.match(profile, "^[^.]+%.(.+%..+)$")
   while locked == nil and parent do
-    locked = locked_strategy_for_profile(parent, proto, scope)
+    locked = locked_lookup(parent, proto, scope)
     if locked ~= nil then
       DLOG("circular_locked: parent lock profile="..parent.." for host profile="..profile)
     end
     parent = string.match(parent, "^[^.]+%.(.+%..+)$")
   end
   if (not locked) and profile ~= base_profile then
-    locked = locked_strategy_for_profile(base_profile, proto, scope)
+    locked = locked_lookup(base_profile, proto, scope)
     if locked then
       DLOG("circular_locked: fallback lock profile="..base_profile.." for host profile="..profile)
     end
