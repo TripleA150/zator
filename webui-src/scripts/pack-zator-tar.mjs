@@ -9,7 +9,8 @@
 // Классы файлов (основа защит при развёртывании):
 //   auto           — всегда заменять;
 //   keep-if-exists — класть только если на устройстве отсутствует
-//                    (пользовательские списки и custom_tls.bin);
+//                    (пользовательские списки, custom_tls.bin,
+//                    lua/client-scope-config.lua);
 //   payload        — только в .deploy-payload;
 //   meta           — extra_strats/cache/deploy/{version.env,manifest.*},
 //                    в сверке не участвуют, deploy перезаписывает сам.
@@ -165,6 +166,9 @@ const KEEP_IF_EXISTS = new Set([
   'extra_strats/TCP_Custom.txt',
   'extra_strats/TCP_RKN_domains_by_substring.txt',
   'files/fake/custom_tls.bin',
+  // генерируемое состояние client scopes (client_scope_lua_config_install_default):
+  // перезапись дефолтом выключала бы скоупы до ресинка
+  'lua/client-scope-config.lua',
 ])
 
 const DEPLOY_CACHE = 'extra_strats/cache/deploy'
@@ -211,6 +215,12 @@ add('_payload/fake_files.tar.gz', 'fake_files.tar.gz', { cls: 'payload' })
 add('_payload/Entware/keenetic-policy.sh', 'Entware/keenetic-policy.sh', { cls: 'payload', executable: true })
 add('_payload/Entware/z2r-strategy-validator', 'Entware/z2r-strategy-validator', { cls: 'payload', executable: true })
 add('_payload/init.d/openwrt/z2r-strategy-validator', 'init.d/openwrt/z2r-strategy-validator', { cls: 'payload', executable: true })
+// entware_fixes и watchdog (п.19) берут их через z2r_download_project_file:
+// без payload офлайн-установка Keenetic падала на 000-zapret2.sh
+for (const rel of ['Entware/zapret', 'Entware/000-zapret2.sh', 'Entware/S00fix',
+  'Entware/zapret2-watchdog', 'init.d/openwrt/zapret2-watchdog']) {
+  add(`_payload/${rel}`, rel, { cls: 'payload', executable: true })
+}
 for (const name of blockcheckZ4r) {
   add(`_payload/blockcheck2.d/z4r/${name}`, `blockcheck2.d/z4r/${name}`, {
     cls: 'payload', executable: name.endsWith('.sh'),
@@ -317,8 +327,9 @@ function octal(value, length) {
 
 function splitName(name) {
   if (name.length <= 100) return { name, prefix: '' }
-  const slash = name.lastIndexOf('/', name.length - 101)
-  if (slash < 0) throw new Error(`слишком длинный путь: ${name}`)
+  // первый '/' не левее length-101: имя после него влезает в 100 байт, префикс — в 155
+  const slash = name.indexOf('/', name.length - 101)
+  if (slash < 0 || slash > 155) throw new Error(`слишком длинный путь: ${name}`)
   return { name: name.slice(slash + 1), prefix: name.slice(0, slash) }
 }
 

@@ -4,7 +4,7 @@ import { applySetting } from '../../api/endpoints'
 import { busyActive, busyButton, withBusy } from '../../stores/busy'
 import { confirmDialog } from '../../stores/confirm'
 import { refreshAll } from '../../stores/status'
-import { fallbackSettings, modeSettings, refreshFallbackSettings, refreshModeSetting } from '../../stores/settings'
+import { fallbackSettings, modeSettings, refreshFallbackSettings, refreshModeSetting, refreshPorts } from '../../stores/settings'
 import { announceRestart, restartSuffix, showToast } from '../../stores/toast'
 import { MODE_TOGGLES } from './modeToggles'
 
@@ -67,6 +67,8 @@ async function submit() {
       await refreshModeSetting(props.setting)
       if (props.setting === 'auto_mode') await refreshFallbackSettings()
       await refreshAll()
+      // антиспуф DNS добавляет/убирает порт 53 в NFQWS2_PORTS_UDP
+      if (props.setting === 'dns_desync') await refreshPorts()
     })
   } catch (error) {
     showToast((error as Error).message, 'error')

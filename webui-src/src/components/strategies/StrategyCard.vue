@@ -5,7 +5,7 @@ import type { CheckPayload, ProfileInfo, Recommendations } from '../../api/types
 import { FALLBACK_CHECK_HINT, UDP_GAMES_CHECK_HINT, currentLockText, gatedPanel, gatedReason, isProfileGated } from '../../gating'
 import { busyActive, busyButton, withBusy } from '../../stores/busy'
 import { refreshAll, scope, strategyChecks } from '../../stores/status'
-import { tlsBlobSettings } from '../../stores/settings'
+import { refreshPorts, tlsBlobSettings } from '../../stores/settings'
 import { showToast } from '../../stores/toast'
 import CheckResults from '../ui/CheckResults.vue'
 import NumberStepper from '../ui/NumberStepper.vue'
@@ -88,6 +88,8 @@ async function save() {
       await setLock(props.profile.profile, value, scope.value)
       delete strategyChecks[props.profile.profile]
       await refreshAll()
+      // лок голосового профиля 6 правит голосовые порты NFQWS2_PORTS_UDP
+      if (String(props.profile.profile) === '6') await refreshPorts()
       if (value !== 0) {
         try {
           strategyChecks[props.profile.profile] = await profileCheck(props.profile.profile, scope.value)
@@ -114,6 +116,7 @@ async function clearLockAction() {
       await clearLock(props.profile.profile, scope.value)
       delete strategyChecks[props.profile.profile]
       await refreshAll()
+      if (String(props.profile.profile) === '6') await refreshPorts()
     })
     showToast(`Lock снят для ${props.profile.label}.`)
   } catch (error) {

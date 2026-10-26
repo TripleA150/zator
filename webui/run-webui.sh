@@ -11,6 +11,9 @@ WEBUI_RUN="$WEBUI_ROOT/run"
 PID_FILE="$WEBUI_RUN/webui.pid"
 LOG_FILE="$WEBUI_RUN/webui.log"
 PORT="${WEBUI_PORT:-17682}"
+# Адрес привязки: по умолчанию все интерфейсы (как раньше); на VPS можно
+# сузить до 127.0.0.1 или LAN-адреса через env WEBUI_BIND.
+BIND="${WEBUI_BIND:-0.0.0.0}"
 
 ensure_dirs() {
   mkdir -p "$WEBUI_RUN"
@@ -90,16 +93,16 @@ run_server_once() {
   local server="$1"
   case "$server" in
     uhttpd_kn)
-      exec uhttpd_kn -f -p "0.0.0.0:${PORT}" -h "$WEBUI_WWW" -x /cgi-bin
+      exec uhttpd_kn -f -p "${BIND}:${PORT}" -h "$WEBUI_WWW" -x /cgi-bin
       ;;
     uhttpd)
-      exec uhttpd -f -p "0.0.0.0:${PORT}" -h "$WEBUI_WWW" -x /cgi-bin
+      exec uhttpd -f -p "${BIND}:${PORT}" -h "$WEBUI_WWW" -x /cgi-bin
       ;;
     httpd)
-      exec httpd -f -p "0.0.0.0:${PORT}" -h "$WEBUI_WWW"
+      exec httpd -f -p "${BIND}:${PORT}" -h "$WEBUI_WWW"
       ;;
     busybox)
-      exec busybox httpd -f -p "0.0.0.0:${PORT}" -h "$WEBUI_WWW"
+      exec busybox httpd -f -p "${BIND}:${PORT}" -h "$WEBUI_WWW"
       ;;
     *)
       echo "No supported web server found" >&2
@@ -201,6 +204,10 @@ detect_lan_ip() {
 
 print_urls() {
   local hostname lan_ip
+  if [ "$BIND" != "0.0.0.0" ]; then
+    echo "http://${BIND}:${PORT}"
+    return 0
+  fi
   hostname="$(hostname 2>/dev/null || true)"
   [ "$hostname" = "localhost" ] && hostname=""
   lan_ip="$(detect_lan_ip || true)"

@@ -14,6 +14,7 @@ case "${REQUEST_METHOD:-GET}" in
     esac
     ;;
   POST)
+    require_post_same_origin
     case "${QUERY_STRING:-}" in
       *action=upload*)
         api_backups_upload

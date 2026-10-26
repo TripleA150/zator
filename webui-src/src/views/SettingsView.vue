@@ -41,7 +41,8 @@ watch(settingsLoaded, (loaded) => {
 
 <template>
   <section class="view is-active" id="view-settings" :class="{ 'is-loading': !settingsLoaded }">
-    <div v-if="settingsLoaded" class="actions">
+    <!-- «Обновить» видна и до загрузки: после сбоя первого state.cgi это единственный повтор на вкладке -->
+    <div class="actions">
       <button id="refresh-settings" :class="{ 'is-busy': busyButton === 'refresh-settings' }" :disabled="busyActive"
         type="button" @click="refresh">Обновить</button>
     </div>
