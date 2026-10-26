@@ -124,4 +124,51 @@ for scenario in success retry both_fail skip; do
     [ ! -e "$TMP_DIR/overlap" ] || fail 'retry overlapped first download'
 done
 
+# Download speaks the TLS version that answered 2xx/3xx: only 1.2 -> pinned to 1.2.
+v='0|200|HTTP/2|0.612|192.0.2.1'
+z2r_tls_probe_version() { if [ "$2" = 13 ]; then printf '%s\n' "$raw13"; else printf '%s\n' "$v"; fi; }
+z2r_tls_probe_download() { printf '%s\n' "$*" >"$TMP_DIR/dl_args"; printf '0|206|65536|1.0\n'; }
+raw13="$bad"; Z2R_TLS_WAIT_BOTH=1 z2r_tls_check_target https://example.org/ >/dev/null
+eq "$(cat "$TMP_DIR/dl_args")" 'https://example.org/ --tlsv1.2 --tls-max 1.2' 'TLS 1.2-only download'
+raw13="$v"; Z2R_TLS_WAIT_BOTH=1 z2r_tls_check_target https://example.org/ >/dev/null
+eq "$(cat "$TMP_DIR/dl_args")" 'https://example.org/' 'default download when TLS 1.3 answered'
+
+# Verdict edge cases: a full page without Range is not a 16KB cut; 404 on
+# TLS 1.2 only is yellow; an early-killed TLS 1.3 is unknown, not unavailable;
+# 200 + 404 is as good as 404 + 404.
+eq "$(z2r_tls_download_state 28 200 600000)" ok 'Range ignored, timeout after 64KB'
+eq "$(z2r_tls_download_state 28 200 4300)" cut '16KB cut'
+eq "$(z2r_tls_target_verdict '0|404|HTTP/1.1|0.2|ip' "$bad" skip)" \
+    'warn|Сайт отвечает только по TLS 1.2 — TLS 1.3 недоступен, современные браузеры могут не открыться. Проверьте вручную.' 'TLS 1.2-only 404'
+eq "$(z2r_tls_target_verdict '0|404|HTTP/1.1|0.2|ip' '0|404|HTTP/1.1|0.2|ip' skip)" \
+    'ok|Доступ есть: TLS работает, сервер ответил кодом 404.' 'both 404'
+eq "$(z2r_tls_target_verdict "$v" 'X|000|-|-|-' "$dl")" 'ok|Сайт доступен: TLS работает, данные идут.' 'TLS 1.3 aborted'
+verdict="$(z2r_tls_target_verdict "$v" "$bad" "$dl")"
+eq "${verdict%%|*}" warn 'TLS 1.3 really failed'
+eq "$(z2r_tls_short_result "$v" '0|404|HTTP/2|0.1|ip' "$dl" both)" 'ok|данные 65536 байт за 1.234 с' '200 + 404 both'
+
+# DNS: SERVFAIL is a resolver failure, the old «Address 1:» header is the
+# resolver itself, dns.google Comment IP is not part of the reference.
+nslookup() { printf '%s\n' "$NS_OUT"; }
+curl() {
+    case "$*" in
+        *dns.google*) printf '%s' '{"Status":0,"Answer":[{"name":"rutracker.org.","type":1,"TTL":300,"data":"104.21.32.39"}],"Comment":"Response from 172.64.33.78."}' ;;
+    esac
+}
+eq "$(z2r_doh_reference rutracker.org)" 'Google DoH (dns.google)|104.21.32.39' 'DoH Comment IP excluded'
+NS_OUT=$'Server:    127.0.0.1\nAddress 1: 127.0.0.1 localhost'
+rc=0; z2r_dns_spoof_gate >/dev/null 2>&1 || rc=$?
+eq "$rc" 1 'old nslookup header with silent resolver'
+NS_OUT=$'Server:    ::1\nAddress 1: ::1 localhost\n\nName:      rutracker.org\nAddress 1: 104.21.32.39'
+rc=0; z2r_dns_spoof_gate >/dev/null 2>&1 || rc=$?
+eq "$rc" 0 'IPv6 header does not swallow the first answer'
+NS_OUT=$'Server:\t\t127.0.0.1\nAddress:\t127.0.0.1#53\n\n** server can\'t find rutracker.org: SERVFAIL'
+rc=0; z2r_dns_spoof_gate >/dev/null 2>&1 || rc=$?
+eq "$rc" 1 'SERVFAIL does not stop the sweep'
+eq "$(Z2R_DNS_TOOL=nslookup z2r_dns_check_target rutracker.org 127.0.0.1)" 'fail|noanswer||||' 'SERVFAIL is noanswer'
+NS_OUT=$'Server:\t\t127.0.0.1\nAddress:\t127.0.0.1#53\n\n** server can\'t find rutracker.org: NXDOMAIN'
+rc=0; z2r_dns_spoof_gate >/dev/null 2>&1 || rc=$?
+eq "$rc" 2 'NXDOMAIN still stops the sweep'
+unset -f nslookup curl
+
 echo 'netcheck cpu smoke ok'

@@ -36,7 +36,11 @@ process_request() {
     if [ "$rc" -eq 0 ]; then
         status=OK
         rm -f "$tostate" 2>/dev/null
-    elif [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+    elif [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ] || [ "$rc" -eq 7 ] ||
+         [ "$rc" -eq 51 ] || [ "$rc" -eq 58 ] || [ "$rc" -eq 60 ] || [ "$rc" -eq 77 ]; then
+        # DNS, закрытый порт, сертификат/CA-бандл (часы до NTP, спуф DNS роутера) —
+        # не признак DPI: ERROR (повтор разрешён), стратегию не блокируем.
+        # Проверку сертификата не отключаем (-k): иначе заглушка провайдера даст OK.
         status=ERROR
     elif [ "$rc" -eq 28 ]; then
         # Одиночный таймаут может быть случайным сбоем — ERROR (разрешён повтор).
@@ -65,10 +69,19 @@ process_request() {
 
 if [ "$1" = "--daemon" ]; then
     mkdir -p "$QUEUE_DIR" || exit 1
+    n=0
     while :; do
         for req in "$QUEUE_DIR"/request.[0-9]*; do
             [ -f "$req" ] && process_request "$req"
         done
+        # Раз в минуту: результаты, которые Lua уже не ждёт (дедлайн 30с), и
+        # просроченные счётчики таймаутов — иначе копятся в tmpfs.
+        n=$((n + 1))
+        if [ "$n" -ge 60 ]; then
+            n=0
+            find "$QUEUE_DIR" -name 'result.*' -mmin +2 -exec rm -f {} \; 2>/dev/null
+            find "$QUEUE_DIR" -name 'to.*' -mmin +10 -exec rm -f {} \; 2>/dev/null
+        fi
         sleep 1
     done
 fi

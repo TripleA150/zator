@@ -185,6 +185,9 @@ assert(#expected_clone(routed_source)>512 and #expected_clone(routed_source)<=12
 blob_override_execute(routed,0,native_instance,'3')
 assert(routed.profile_clone and #routed.profile_clone<=512,
   'native clone ignored the routed logical profile size limit')
+local routed_exts={}
+for _,e in ipairs(tls_dissect(routed.profile_clone).handshake[1].dis.ext) do routed_exts[e.type]=true end
+assert(routed_exts[51] and not routed_exts[21], 'clone cut dropped key_share before padding')
 assert(routed.z2r_clone_profile_key==nil, 'logical profile leaked after execution')
 locked_load_clone_size_for_tests({})
 print('PASS native producer uses routed logical profile size limit')
@@ -246,5 +249,15 @@ for _,func in ipairs({'fake','fakemultisplit','fakemultidisorder'}) do
   assert(cap_desync.z2r_clone_profile_key=='outer-profile', 'cap exception leaked profile')
 end
 print('PASS blob override, global cap, SNI and temporary fields restored after executor errors')
+_G.overclaim_blob=bu8(22)..bu16(0x0303)..bu16(122)..string.rep('h',122)
+  ..bu8(23)..bu16(0x0303)..bu16(5221)..string.rep('d',1076)
+locked_load_blob_override_for_tests({'3\toverclaim_blob'})
+local capped
+function plan_instance_execute(d,v,i) capped=blob(d,i.arg.blob); return v end
+blob_override_execute({},0,{func='fake',arg={blob='maxru'}},'3')
+assert(capped and #capped==1200 and capped:byte(131)*256+capped:byte(132)==1068,
+  'over-claiming TLS record bypassed the 1200 cap')
+locked_load_blob_override_for_tests({})
+print('PASS truncated last TLS record is capped with an honest length')
 ''')
 print('clone size limit regression ok')

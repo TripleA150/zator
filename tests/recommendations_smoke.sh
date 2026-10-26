@@ -37,6 +37,12 @@ json="$(recommendations_json)"
 [[ "$json" == *'"strategy":7'* && "$json" == *'"clone_recommended":true'* ]]
 hint="$(show_hint TCP)"
 [[ "$hint" == *7* && "$hint" == *ClientHello* ]]
+# Порядок автопрогона берёт топ из кеша без сети; чужой провайдер — пусто.
+[ "$(recommendations_strategies 1 | tr '\n' ' ')" = '7 2 9 ' ]
+[ "$(calls)" = 1 ]
+printf 'OtherNet - Town\n' > "$PROVIDER_CACHE"
+[ -z "$(recommendations_strategies 1)" ]
+printf 'TestNet - Town\n' > "$PROVIDER_CACHE"
 mode_override_get() { printf clone; }
 [[ "$(show_hint TCP)" != *'Попробуйте включить'* ]]
 unset -f mode_override_get

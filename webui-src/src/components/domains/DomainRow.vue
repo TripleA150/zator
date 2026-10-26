@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { domains } from '../../api/endpoints'
 import type { DomainItem } from '../../api/types'
 import { busyActive, busyButton, withBusy } from '../../stores/busy'
@@ -27,6 +27,10 @@ const strategyChip = computed(() => {
 })
 
 const trialValue = ref('1')
+// Стратегия домена до подбора (0 — не было) и признак применённой пробы:
+// «Отмена» и сворачивание возвращают прежнюю, как prev_strat в CLI.
+const savedStrategy = ref(0)
+const trialApplied = ref(false)
 const trialMax = computed(() => {
   const max = domainLists.custom_rkn?.max_strategy
   return Number.isFinite(max) && (max as number) > 0 ? (max as number) : 19
@@ -34,17 +38,19 @@ const trialMax = computed(() => {
 
 async function runTrialApply(strategy: string) {
   const payload = await domains.set_strategy(props.item.value, strategy)
+  trialApplied.value = true
   domainChecks[props.item.value] = payload?.check || { results: [] }
 }
 
 function toggleTrial() {
   if (expanded.value) {
-    expandedDomain.value = null
+    void trialCancel()
     return
   }
   const item = (domainLists.custom_rkn?.items || []).find((it) => it.value === props.item.value)
-  const start = item && Number.isFinite(item.strategy) && (item.strategy as number) > 0 ? item.strategy : 1
-  trialValue.value = String(start)
+  savedStrategy.value = item && Number.isFinite(item.strategy) && (item.strategy as number) > 0 ? item.strategy as number : 0
+  trialApplied.value = false
+  trialValue.value = String(savedStrategy.value || 1)
   expandedDomain.value = props.item.value
 }
 
@@ -91,6 +97,7 @@ async function trialPrev() {
 async function trialSave() {
   try {
     await withBusy('trial-save', async () => { await runTrialApply(trialValue.value) })
+    trialApplied.value = false
     showToast(`Стратегия ${trialValue.value} сохранена для ${props.item.value}.`)
     expandedDomain.value = null
     await refreshDomainList('custom_rkn')
@@ -100,14 +107,20 @@ async function trialSave() {
 }
 
 async function trialCancel() {
-  expandedDomain.value = null
+  if (expanded.value) expandedDomain.value = null
+  if (!trialApplied.value) return
+  trialApplied.value = false
   try {
-    await domains.clear_strategy(props.item.value)
+    if (savedStrategy.value > 0) await domains.set_strategy(props.item.value, String(savedStrategy.value))
+    else await domains.clear_strategy(props.item.value)
   } catch (error) {
     showToast((error as Error).message, 'error')
   }
   await refreshDomainList('custom_rkn')
 }
+
+// Панель свернулась открытием подбора у другого домена — проба тоже откатывается.
+watch(expanded, (open) => { if (!open && trialApplied.value) void trialCancel() })
 
 async function checkDomain() {
   try {
@@ -162,6 +175,7 @@ async function submitRename() {
   try {
     await withBusy('domain-rename', async () => {
       await domains.rename(props.list, props.item.value, next)
+      trialApplied.value = false // локи переехали на новое имя — откатывать старое нечего
       if (expandedDomain.value === props.item.value) expandedDomain.value = null
       delete domainChecks[props.item.value]
       showToast(`Переименовано в «${next}».`)

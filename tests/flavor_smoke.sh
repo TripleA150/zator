@@ -173,6 +173,24 @@ Z2R_OFFLINE=1 ZATOR_ROOT="$ZATOR_ROOT" bash -c '
 r="$?"
 [ "$r" = 0 ] && ok "prompt: offline пропускает" || bad "prompt: offline rc=$r"
 
+# --- 5. version_select без API: установленная версия, иначе ручной ввод ---
+# (версии-заглушки нет: 0.8.2 у форка не существует)
+extract version_select "$TMP/version_select.sh" || bad "извлечение version_select"
+cat > "$TMP/vs_mock.sh" <<'EOF'
+curl() { printf '%s' '{"message":"API rate limit exceeded"}'; }
+zapret2_version_short() { printf '%s' "$INST"; }
+EOF
+vs() { # vs installed input -> VER
+  ZATOR_ROOT="$ZATOR_ROOT" INST="$1" IN="$2" bash -c '
+    . "'"$TMP"'/lib.sh"; . "'"$TMP"'/version_select.sh"; . "'"$TMP"'/vs_mock.sh"
+    zapret2_flavor_save fork >/dev/null
+    version_select < <(printf "$IN") >/dev/null 2>&1; echo "$VER"'
+}
+r="$(vs v1.0.6-reasm-fix '\n')"
+[ "$r" = 1.0.6-reasm-fix ] && ok "version_select: без API -> установленная версия" || bad "version_select: без API -> '$r'"
+r="$(vs '' '\n1.0.5.1\n')"
+[ "$r" = 1.0.5.1 ] && ok "version_select: без API и установки -> ручной ввод" || bad "version_select: без установки -> '$r'"
+
 echo "==============================="
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ] && echo "flavor smoke ok"

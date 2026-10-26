@@ -149,6 +149,12 @@ head -1 "$STAGE/extra_strats/cache/deploy/manifest.tsv" | grep -q '^# path|dest|
 grep -q '^_root/z2r.sh|/opt/z2r.sh|auto|' "$STAGE/extra_strats/cache/deploy/manifest.tsv" || fail "manifest без _root/z2r.sh"
 grep -q '^_payload/config.default|/opt/zator/.deploy-payload/config.default|payload|' "$STAGE/extra_strats/cache/deploy/manifest.tsv" || fail "manifest без payload"
 grep -q '^lists/netrogat.txt|.*|keep-if-exists|' "$STAGE/extra_strats/cache/deploy/manifest.tsv" || fail "manifest без keep-if-exists у netrogat"
+# генерируемое состояние client scopes: деплой не должен сбрасывать его в ENABLE=0
+grep -q '^lua/client-scope-config.lua|.*|keep-if-exists|' "$STAGE/extra_strats/cache/deploy/manifest.tsv" || fail "client-scope-config.lua не keep-if-exists"
+# entware_fixes/watchdog берут их из payload: без них офлайн-Keenetic падал на 000-zapret2.sh
+for p in Entware/zapret Entware/000-zapret2.sh Entware/S00fix Entware/zapret2-watchdog init.d/openwrt/zapret2-watchdog; do
+  grep -q "^_payload/$p|.*|payload|.*|1\$" "$STAGE/extra_strats/cache/deploy/manifest.tsv" || fail "manifest без исполняемого payload $p"
+done
 check_symlink "$STAGE/webui/www/cgi-bin" || fail "нет symlink webui/www/cgi-bin"
 grep -q $'\r' "$STAGE/lists/netrogat.txt" 2>/dev/null && fail "CRLF в netrogat.txt"
 expected_ver="$(sed -n 's/^ZATOR_VERSION="\(.*\)"$/\1/p' "$STAGE/extra_strats/cache/deploy/version.env")"
@@ -183,6 +189,17 @@ exp_webui_sha="$(grep '"webuiSha":' "$SMOKE_JSON_SRC" | head -n1 | sed 's/.*: *"
 [ -n "$DEPLOY_META_ASSET_WEBUI_SHA" ] || fail "DEPLOY_META_ASSET_WEBUI_SHA пуст"
 [ "$DEPLOY_META_ASSET_WEBUI_SHA" != "$exp_webui_sha" ] || fail "тест не различает контентный и ассетный sha"
 ok "deploy_fetch_release_meta: контентный и ассетный sha разделены"
+
+# регрессия: raw-установка (version.env без ZATOR_SHA) считалась «актуальной»,
+# п.5 -> п.2 отказывался ставить релиз
+mkdir -p "$DEPLOY_CACHE_DIR"
+printf 'ZATOR_VERSION="branch"\nZATOR_DATE="2026-01-01"\nTRACKING="latest"\n' > "$DEPLOY_VERSION_FILE"
+deploy_check_latest >/dev/null 2>&1 || fail "deploy_check_latest упал"
+[ "$DEPLOY_UPDATE_ZATOR" = 1 ] || fail "пустой ZATOR_SHA не предлагает обновление"
+deploy_menu_header >/dev/null 2>&1
+case "$MENU_DEPLOY_NOTICE" in *"Доступно обновление"*) ;; *) fail "шапка молчит при неизвестной версии ядра" ;; esac
+rm -f "$DEPLOY_VERSION_FILE" "$DEPLOY_LATEST_FILE"
+ok "неизвестная версия (без SHA) предлагает обновление"
 
 # регрессия set -e: deploy_menu_header с отсутствующими version.env/latest.env
 # не должен ронять вызывающий скрипт; без установленной панели шапка не должна
@@ -352,6 +369,19 @@ printf 'file|/etc/cron.d/pwn|auto|%s|1|0\n' "$(file_sha256 "$BAD_MAN_DIR/stage/f
     source lib/deploy.sh >/dev/null 2>&1
     deploy_apply_staging "'"$BAD_MAN_DIR"'/stage" latest' ) > "$BAD_MAN_DIR/out.txt" 2>&1
 grep -q '/etc/cron.d/pwn' "$BAD_MAN_DIR/out.txt" || fail "манифест с /etc dest не отклонён"
+# «*» в /opt/zator/* матчит и ../ — обход allow-листа через traversal
+deploy_dest_ok /opt/zator/lua/x.lua || fail "deploy_dest_ok отклонил законный dest"
+deploy_dest_ok /opt/z2r.sh || fail "deploy_dest_ok отклонил /opt/z2r.sh"
+for d in /opt/zator/../etc/init.d/S99x /opt/zator/lua/.. /opt/zator/./x /etc/x; do
+  deploy_dest_ok "$d" && fail "deploy_dest_ok пропустил $d"
+done
+printf 'file|/opt/zator/../escaped|auto|%s|1|0\n' "$(file_sha256 "$BAD_MAN_DIR/stage/file")" \
+  > "$BAD_MAN_DIR/stage/extra_strats/cache/deploy/manifest.tsv"
+( cd "$REPO_DIR" && ZATOR_ROOT="$WORK/badman-target" bash -c '
+    source lib/deploy.sh >/dev/null 2>&1
+    deploy_apply_staging "'"$BAD_MAN_DIR"'/stage" latest' ) > "$BAD_MAN_DIR/out2.txt" 2>&1
+grep -q 'Недопустимый dest' "$BAD_MAN_DIR/out2.txt" || fail "манифест с ../ в dest не отклонён"
+[ ! -e "$WORK/escaped" ] || fail "traversal-dest записан за пределы корня"
 ok "харденинг: tar с ../ и манифест с чужим dest отклоняются"
 
 deploy_from_tar "$DIST/zator-full.tar.gz" >/dev/null 2>&1 || fail "deploy_from_tar (A) упал"
@@ -466,6 +496,8 @@ grep -q "^WEBUI_VERSION=\"$expected_ver\"$" "$ZATOR_ROOT/extra_strats/cache/depl
 grep -q '^webui/' "$ZATOR_ROOT/extra_strats/cache/deploy/manifest.webui.tsv" || fail "manifest.webui без webui-строк"
 ! grep -q '^webui/' "$ZATOR_ROOT/extra_strats/cache/deploy/manifest.core.tsv" || fail "manifest.core содержит webui-строки"
 ok "слияние version.env по компонентам, манифесты по компонентам"
+# п.3 ставит только панель: tracking="" сохраняет закреплённый TRACKING ядра
+grep -q 'zator-webui.tar.gz" webui ""' "$REPO_DIR/lib/deploy.sh" || fail "п.3 (только панель) снимает закрепление ядра"
 
 # --- 6. режим C: тесный /tmp, перестановка каталогов ---
 
@@ -514,6 +546,34 @@ grep -q 'lock-runtime' "$ZATOR_ROOT/extra_strats/cache/orchestra/locked.tsv" || 
 grep -q 'autohost-runtime' "$ZATOR_ROOT/lists/autohostlist.txt" || fail "режим C: autohostlist не перенесён"
 ok "режим C: перестановка каталогов, переносы runtime и защит"
 
+# регрессия: перенос старого дерева затирал version.env архива живой копией —
+# версия не продвигалась (до деплоя C там ZATOR_DATE=2000 из шага 5)
+grep -q '^ZATOR_DATE="2000-01-01 00:00"$' "$DEPLOY_VERSION_FILE" && fail "режим C: version.env не продвинулся"
+grep -q "^ZATOR_VERSION=\"$expected_ver\"$" "$DEPLOY_VERSION_FILE" || fail "режим C: ZATOR_VERSION не из архива"
+# webui-only в режиме C: WEBUI_* новые, ZATOR_* и core-манифест прежние
+sed -i 's/^ZATOR_DATE=.*/ZATOR_DATE="1999-01-01 00:00"/; s/^WEBUI_DATE=.*/WEBUI_DATE="2000-01-01 00:00"/' "$DEPLOY_VERSION_FILE"
+core_rows_before="$(grep -c '^z2r_lib/' "$DEPLOY_CACHE_DIR/manifest.core.tsv")"
+w_free_kb=$(( $(gzip -l "$DIST/zator-webui.tar.gz" | awk 'NR==2 {print $2}') / 1024 + 1 + DEPLOY_MARGIN_KB + DEPLOY_SLACK_KB + 1 ))
+TMP_FREE_KB=100 OPT_FREE_KB="$w_free_kb" PATH="$WORK/bin:$PATH" deploy_from_tar "$DIST/zator-webui.tar.gz" >/dev/null 2>&1 \
+  || fail "deploy_from_tar (C, webui) упал"
+grep -q '^WEBUI_DATE="2000-01-01 00:00"$' "$DEPLOY_VERSION_FILE" && fail "режим C webui: WEBUI_* не продвинулся"
+grep -q '^ZATOR_DATE="1999-01-01 00:00"$' "$DEPLOY_VERSION_FILE" || fail "режим C webui: затёр ZATOR_*"
+[ "$(grep -c '^z2r_lib/' "$DEPLOY_CACHE_DIR/manifest.core.tsv")" = "$core_rows_before" ] \
+  || fail "режим C webui: manifest.core.tsv переписан (webui принят за core)"
+[ -f "$ZATOR_ROOT/z2r_lib/config.sh" ] || fail "режим C webui: ядро не перенесено"
+# свежая установка в существующий каталог без z2r_lib: дерево не должно вложиться внутрь
+C_ROOT="$WORK/zator-c-fresh"
+mkdir -p "$C_ROOT/extra_strats/cache"
+printf 'fork\n' > "$C_ROOT/extra_strats/cache/zapret2_flavor"
+( export ZATOR_ROOT="$C_ROOT"
+  source "$REPO_DIR/lib/deploy.sh"
+  TMP_FREE_KB=100 OPT_FREE_KB="$c_free_kb" PATH="$WORK/bin:$PATH" deploy_from_tar "$DIST/zator-full.tar.gz" ) >/dev/null 2>&1 \
+  || fail "deploy_from_tar (C, fresh) упал"
+[ -f "$C_ROOT/z2r_lib/config.sh" ] || fail "режим C fresh: z2r_lib не в корне (дерево вложено?)"
+ls "$C_ROOT" | grep -q 'deploy.new' && fail "режим C fresh: новое дерево вложено в существующий каталог"
+grep -q '^fork$' "$C_ROOT/extra_strats/cache/zapret2_flavor" || fail "режим C fresh: остатки каталога не перенесены"
+ok "режим C: version.env и манифесты продвигаются, webui-only не трогает ядро, fresh не вкладывается"
+
 # --- 7. целостность ---
 
 integrity_out="$(deploy_integrity_check 2>/dev/null)" || fail "integrity_check упал"
@@ -530,7 +590,9 @@ reset_list="$(deploy_reset_user_files "$DIST/zator-full.tar.gz" <<< "0" 2>/dev/n
 custom_num="$(printf '%s\n' "$reset_list" | sed -n 's/^\([0-9]*\)\. extra_strats\/TCP_Custom.txt$/\1/p' | head -1)"
 [ -n "$custom_num" ] || fail "TCP_Custom.txt не попал в список изменённых"
 
+printf 'Z2R_CLIENT_SCOPE_ENABLE = 1\n' > "$ZATOR_ROOT/lua/client-scope-config.lua"
 deploy_reset_user_files "$DIST/zator-full.tar.gz" <<< "all" >/dev/null 2>&1 || fail "reset_user_files (all) упал"
+grep -q 'ENABLE = 1' "$ZATOR_ROOT/lua/client-scope-config.lua" || fail "reset all сбросил client-scope-config.lua (генерируемое состояние)"
 grep -q 'custom.example' "$ZATOR_ROOT/extra_strats/TCP_Custom.txt" && fail "TCP_Custom не сброшен к эталону (all)"
 grep -q 'user-domain-2.example' "$ZATOR_ROOT/lists/netrogat.txt" && fail "netrogat не сброшен к эталону (all)"
 
@@ -546,7 +608,11 @@ OFFLINE_DIR="$WORK/offline"
 mkdir -p "$OFFLINE_DIR/fake-z/zapret2-v1.0.5.1-reasm-fix"
 printf '#!/bin/sh\n' > "$OFFLINE_DIR/fake-z/zapret2-v1.0.5.1-reasm-fix/install_bin.sh"
 printf '#!/bin/sh\n' > "$OFFLINE_DIR/fake-z/zapret2-v1.0.5.1-reasm-fix/install_easy.sh"
+# windows-бинарники заставляют сборщик пересобрать архив без них
+mkdir -p "$OFFLINE_DIR/fake-z/zapret2-v1.0.5.1-reasm-fix/binaries/windows-x86_64"
+printf 'exe' > "$OFFLINE_DIR/fake-z/zapret2-v1.0.5.1-reasm-fix/binaries/windows-x86_64/winws2.exe"
 tar -czf "$OFFLINE_DIR/zapret2-v1.0.5.1-reasm-fix.tar.gz" -C "$OFFLINE_DIR/fake-z" zapret2-v1.0.5.1-reasm-fix
+z2_input_sum="$(cksum < "$OFFLINE_DIR/zapret2-v1.0.5.1-reasm-fix.tar.gz")"
 tar -czf "$OFFLINE_DIR/zapret2-v1.0.5.1-reasm-fix-openwrt-embedded.tar.gz" -C "$OFFLINE_DIR/fake-z" zapret2-v1.0.5.1-reasm-fix
 bash "$REPO_DIR/tools/build-offline-archive.sh" \
   --zator-tar "$DIST/zator-full.tar.gz" \
@@ -555,6 +621,8 @@ bash "$REPO_DIR/tools/build-offline-archive.sh" \
   --version 1.0.5.1-reasm-fix \
   --project-dir "$REPO_DIR" \
   --output "$OFFLINE_DIR/zator-offline-test.tar.gz" >/dev/null || fail "сборка офлайн-бандла упала"
+[ "$(cksum < "$OFFLINE_DIR/zapret2-v1.0.5.1-reasm-fix.tar.gz")" = "$z2_input_sum" ] \
+  || fail "сборщик переписал входной архив пользователя (strip на месте)"
 tar -tzf "$OFFLINE_DIR/zator-offline-test.tar.gz" | grep -q 'zator-full.tar.gz' || fail "в бандле нет zator-full.tar.gz"
 tar -tzf "$OFFLINE_DIR/zator-offline-test.tar.gz" | grep -q 'README.txt' || fail "в бандле нет README.txt"
 rm -rf "$OFFLINE_DIR/run" "$OFFLINE_DIR/optroot" "$OFFLINE_DIR/bin"
@@ -569,6 +637,12 @@ grep -q 'OFFLINE_READY version=1.0.5.1-reasm-fix' "$OFFLINE_DIR/install.out" || 
 [ -f "$OFFLINE_DIR/optroot/zator/.deploy-payload/config.default" ] || fail "офлайн: нет payload config.default"
 [ -f "$OFFLINE_DIR/optroot/zator/.deploy-payload/fake_files.tar.gz" ] || fail "офлайн: нет payload fake_files.tar.gz"
 [ -f "$OFFLINE_DIR/optroot/zator/.deploy-payload/Entware/z2r-strategy-validator" ] || fail "офлайн: нет payload validator"
+[ -x "$OFFLINE_DIR/optroot/zator/.deploy-payload/Entware/000-zapret2.sh" ] || fail "офлайн: нет payload ndm-хука (entware_fixes упадёт без сети)"
+[ -x "$OFFLINE_DIR/optroot/zator/.deploy-payload/Entware/zapret" ] || fail "офлайн: нет payload sysv-инита Entware/zapret"
+# legacy payload/-ветка лаунчера проверяет LIB_FILES: список обязан совпадать с z2r.sh
+z2r_libs="$(sed -n 's/^Z2R_LIB_FILES="\(.*\)"$/\1/p' "$REPO_DIR/z2r.sh")"
+off_libs="$(sed -n 's/^LIB_FILES="\(.*\)"$/\1/p' "$REPO_DIR/offline/z2r")"
+[ -n "$z2r_libs" ] && [ "$z2r_libs" = "$off_libs" ] || fail "offline/z2r LIB_FILES расходится с Z2R_LIB_FILES z2r.sh"
 grep -q '^TRACKING="offline-1.0.5.1-reasm-fix"$' "$OFFLINE_DIR/optroot/zator/extra_strats/cache/deploy/version.env" || fail "офлайн: TRACKING не закреплён"
 grep -q '^AUTOUPDATE=off$' "$OFFLINE_DIR/optroot/z2r.conf" || fail "офлайн: AUTOUPDATE не выключен"
 [ -f "$OFFLINE_DIR/bin/z2r" ] || fail "офлайн: команда z2r не установлена"

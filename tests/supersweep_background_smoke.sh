@@ -39,6 +39,8 @@ z2r_tls_probe_download https://example.com/ >/dev/null
 [ "$(grep -c -- '--local-port' "$TMP/curl.args")" = 2 ]
 # Build from deployed source, not develop strategies or its adaptive extensions.
 source lib/supersweep_probe.sh
+# Как в раннере: probe_stop берёт lock транспорта из этого модуля.
+source lib/supersweep_transport.sh
 # Router BusyBox can reject fractional sleep; no unguarded fractional waits.
 if grep -nE 'sleep [0-9]+\.[0-9]+[[:space:]]*$' lib/supersweep_probe.sh lib/orchestra_state.sh; then
     echo 'FAIL: unguarded fractional sleep on router' >&2
@@ -53,6 +55,16 @@ fi
     [ -e "$Z2R_SUPERSWEEP_DIR/cancel" ]
 )
 rm -f "$Z2R_SUPERSWEEP_DIR/cancel"
+# DNS-сбой цели (curl rc=6 в обеих версиях): пакетов нет, очередь стоит —
+# это красная проба мёртвого домена, а не потеря изоляции и не отмена прогона.
+(
+    supersweep_probe_healthy() { return 0; }
+    supersweep_probe_sequence() { echo 0; }
+    z2r_tls_check_target() { printf '6|000|-|-|-\n6|000|-|-|-\nskip\n'; }
+    out="$(_supersweep_check_target https://nxdomain.example/)"
+    [ "${out%%|*}" = 6 ]
+    [ ! -e "$Z2R_SUPERSWEEP_DIR/cancel" ]
+)
 # A post-probe health failure invalidates the answer, even if health recovers.
 for health_failure in transient reinstall repeated; do
 (
@@ -123,8 +135,17 @@ rm -f "$Z2R_SUPERSWEEP_DIR/cancel"
     calls=0
     supersweep_transport_stop() { calls=$((calls + 1)); [ "$calls" -gt 3 ]; }
     Z2R_SUPERSWEEP_TRANSPORT_ACTIVE=1
+    : > "$Z2R_SUPERSWEEP_DIR/probe/transport.env"
+    sleep 30 &
+    Z2R_SUPERSWEEP_NFQ_PID=$!
+    nfq_child=$Z2R_SUPERSWEEP_NFQ_PID
     ! supersweep_probe_stop
     [ "$Z2R_SUPERSWEEP_TRANSPORT_ACTIVE" = 1 ]
+    # env убран до очистки, lock транспорта отпущен; --queue-bypass позволяет
+    # погасить пробник и при неубранных правилах — очередь 65535 не висит.
+    [ ! -e "$Z2R_SUPERSWEEP_DIR/probe/transport.env" ]
+    [ ! -d "$Z2R_SUPERSWEEP_DIR/probe/transport.lock" ]
+    ! kill -0 "$nfq_child" 2>/dev/null
     supersweep_probe_stop
     [ "$calls" = 4 ]
 )
@@ -203,6 +224,8 @@ MOCK
 cat > "$TMP/bin/iptables" <<'MOCK'
 #!/bin/sh
 echo "$*" >> "$TMP/iptables.args"
+# Проверка порядка: наши переходы первыми в POSTROUTING/INPUT.
+case " $* " in *' -S '*) printf -- '-A POSTROUTING -j Z2R_SS_POST\n-A INPUT -j Z2R_SS_IN\n' ;; esac
 MOCK
 # OpenWrt may have setsid but no nohup; inherited ignored HUP is sufficient.
 cat > "$TMP/bin/nohup" <<'MOCK'
@@ -383,6 +406,34 @@ grep -q 'qnum=65535' "$TMP/ensure.sh"
 grep -q 'supersweep_transport_reconcile' Entware/000-zapret2.sh
 grep -q 'transport.env' Entware/000-zapret2.sh
 sh -n Entware/000-zapret2.sh
+# Хук идёт от root, /tmp открыт всем: transport.env исполняется только из
+# своих путей без симлинков. Живой прогон хука под sh (без рабочего zapret2).
+if [ ! -e /opt/zapret2/init.d/sysv/zapret2 ]; then
+    hook_root="$TMP/hook"
+    mkdir -p "$hook_root/zator/z2r_lib" "$hook_root/run/probe"
+    printf 'supersweep_transport_reconcile() { : > "%s/reconciled"; }\n' "$hook_root" \
+        > "$hook_root/zator/z2r_lib/supersweep_transport.sh"
+    : > "$hook_root/run/probe/transport.env"
+    run_hook() { table=mangle ZATOR_ROOT="$hook_root/zator" Z2R_SUPERSWEEP_DIR="$1" sh Entware/000-zapret2.sh >/dev/null 2>&1; }
+    run_hook "$hook_root/run"
+    [ -e "$hook_root/reconciled" ]
+    rm -f "$hook_root/reconciled"
+    ln -s "$hook_root/run" "$hook_root/link"
+    run_hook "$hook_root/link"
+    [ ! -e "$hook_root/reconciled" ]
+    mv "$hook_root/run/probe/transport.env" "$hook_root/env.real"
+    ln -s "$hook_root/env.real" "$hook_root/run/probe/transport.env"
+    run_hook "$hook_root/run"
+    [ ! -e "$hook_root/reconciled" ]
+    if [ "$(id -u)" = 0 ]; then
+        rm -f "$hook_root/run/probe/transport.env"
+        mv "$hook_root/env.real" "$hook_root/run/probe/transport.env"
+        chown 65534 "$hook_root/run/probe/transport.env"
+        run_hook "$hook_root/run"
+        [ ! -e "$hook_root/reconciled" ]
+    fi
+fi
+! grep -q '/tmp/z2r-supersweep-hook.log' Entware/000-zapret2.sh
 # Probe lifecycle must publish/remove the hook env file.
 sed -n '/^supersweep_probe_stop()/,/^}/p' lib/supersweep_probe.sh > "$TMP/pstop.sh"
 grep -q 'rm -f.*transport.env' "$TMP/pstop.sh"

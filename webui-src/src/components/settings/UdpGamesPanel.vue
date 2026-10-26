@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { applySetting } from '../../api/endpoints'
 import { busyActive, busyButton, withBusy } from '../../stores/busy'
 import { refreshAll } from '../../stores/status'
-import { refreshUdpGamesSettings, udpGamesSettings } from '../../stores/settings'
+import { refreshPorts, refreshUdpGamesSettings, udpGamesSettings } from '../../stores/settings'
 import { announceRestart, restartSuffix, showToast } from '../../stores/toast'
 
 const settings = computed(() => udpGamesSettings.value)
@@ -23,6 +23,8 @@ async function submit() {
       showToast((enabled.value ? 'Игровой UDP включён.' : 'Игровой UDP выключен.') + restartSuffix(payload))
       await refreshUdpGamesSettings()
       await refreshAll()
+      // переключатель правит NFQWS2_PORTS_UDP (1026-65531)
+      await refreshPorts()
     })
   } catch (error) {
     showToast((error as Error).message, 'error')

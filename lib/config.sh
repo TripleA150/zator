@@ -75,7 +75,8 @@ config_set_var() {
   local esc_val
 
   [ -f "$cfg" ] || return 1
-  esc_val=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
+  # '#' — разделитель sed ниже, '\' и '&' — спецсимволы замены: экранируем все.
+  esc_val=$(printf '%s' "$val" | sed 's/[\\/&#]/\\&/g')
   if grep -q "^[[:space:]]*${var}=" "$cfg"; then
     sed -i "s#^[[:space:]]*${var}=.*#${var}=${esc_val}#" "$cfg"
   else

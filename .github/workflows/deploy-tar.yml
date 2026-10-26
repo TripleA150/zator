@@ -58,11 +58,16 @@ jobs:
         with:
           node-version: '24'
 
+      # тег считается один раз: номерной релиз обязан совпадать с версией в архивах
       - name: Pack variants
+        id: rel
         working-directory: webui-src
         env:
           VERSION_ARG: ${{ inputs.version }}
-        run: node scripts/pack-zator-tar.mjs --variant=all --repo "$GITHUB_REPOSITORY" ${VERSION_ARG:+--version="$VERSION_ARG"}
+        run: |
+          TAG="${VERSION_ARG:-stable-$(date -u +%Y%m%d-%H%M)}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          node scripts/pack-zator-tar.mjs --variant=all --repo "$GITHUB_REPOSITORY" --version="$TAG"
 
       - name: Verify outputs
         run: |
@@ -103,22 +108,14 @@ jobs:
           rm -f "webui-src/dist/zapret2-v$V.tar.gz" "webui-src/dist/zapret2-v$V-openwrt-embedded.tar.gz"
           (cd webui-src/dist && sha256sum "zator-offline-$V.tar.gz" > "zator-offline-$V.tar.gz.sha256")
 
+      # отдельный каталог: старый офлайн-бандл едет только в latest, не в номерной релиз
       - name: Carry over offline asset from previous latest
         if: ${{ inputs.update_latest && !inputs.build_offline }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download latest -p 'zator-offline-*' -D webui-src/dist --clobber \
+          gh release download latest -p 'zator-offline-*' -D offline-carry --clobber \
             || echo "офлайн-ассета в предыдущем latest не было"
-
-      - name: Release version tag
-        id: rel
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=stable-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Recreate rolling release latest
         if: ${{ inputs.update_latest }}
@@ -126,8 +123,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
+          set -- webui-src/dist/*
+          for f in offline-carry/*; do if [ -f "$f" ]; then set -- "$@" "$f"; fi; done
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest webui-src/dist/* \
+          gh release create latest "$@" \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "latest" \

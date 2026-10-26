@@ -10,11 +10,14 @@
 get_yt_cluster_domain() {
     local letters_map_a="u z p k f a 5 0 v q l g b 6 1 w r m h c 7 2 x s n i d 8 3 y t o j e 9 4 -"
     local letters_map_b="0 1 2 3 4 5 6 7 8 9 a b c d e f g h i j k l m n o p q r s t u v w x y z -"
+    local c2
 
     cluster_codename=$(curl -4 -s -k -A "$Z2R_CURL_UA" --max-time 4 "https://redirector.xn--ngstr-lra8j.com/report_mapping?di=no"| sed -n 's/.*=>[[:space:]]*\([^ (:)]*\).*/\1/p')
-	#Второй раз для пробития нерелевантного ответа
-    cluster_codename=$(curl -4 -s -k -A "$Z2R_CURL_UA" --max-time 4 "https://redirector.xn--ngstr-lra8j.com/report_mapping?di=no"| sed -n 's/.*=>[[:space:]]*\([^ (:)]*\).*/\1/p')
-    
+	#Второй раз для пробития нерелевантного ответа; сбой второго запроса не
+	#затирает уже полученный кластер (иначе — чужой захардкоженный фоллбек)
+    c2=$(curl -4 -s -k -A "$Z2R_CURL_UA" --max-time 4 "https://redirector.xn--ngstr-lra8j.com/report_mapping?di=no"| sed -n 's/.*=>[[:space:]]*\([^ (:)]*\).*/\1/p')
+    if [ -n "$c2" ]; then cluster_codename="$c2"; fi
+
     [ -z "$cluster_codename" ] && {
         echo "Не удалось получить cluster_codename. Используем тогда rr2---sn-4g5ednly.googlevideo.com" >&2
         echo "rr2---sn-4g5ednly.googlevideo.com"
@@ -43,7 +46,9 @@ Z2R_TLS_MAX_TIME=5
 Z2R_TLS_DL_RANGE=65536
 Z2R_TLS_DL_MAX_TIME=10
 Z2R_TLS_DL_SPEED_LIMIT=2048
-Z2R_TLS_DL_SPEED_TIME=1
+# 2 сек, а не 1: таймер низкой скорости curl идёт и до первого байта тела —
+# медленный origin (TTFB ~1-2 с) не должен читаться как «данные не приходят»
+Z2R_TLS_DL_SPEED_TIME=2
 
 # Функции движка всегда возвращают 0 (вызовы под set -e в z2r.sh):
 # код возврата curl передаётся внутри данных, а не статусом функции.
@@ -115,8 +120,10 @@ z2r_tls_probe_version() (
     printf '%s|%s|%s|%s|%s\n' "$rc" "$code" "$proto" "$time" "$ip"
 )
 
+# Дополнительные аргументы после url — флаги версии TLS для curl.
 z2r_tls_probe_download() {
     local url="$1" out rc code rest size time
+    shift
     rc=0
 
     out="$(z2r_tls_curl -4 -s -L -k -o /dev/null -A "$Z2R_CURL_UA" \
@@ -124,7 +131,7 @@ z2r_tls_probe_download() {
         --speed-limit "$Z2R_TLS_DL_SPEED_LIMIT" --speed-time "$Z2R_TLS_DL_SPEED_TIME" \
         -H "Range: bytes=0-$((Z2R_TLS_DL_RANGE - 1))" \
         -w '%{http_code} %{size_download} %{time_total}' \
-        "$url" 2>/dev/null)" || rc=$?
+        "$@" "$url" 2>/dev/null)" || rc=$?
     code="${out%% *}"; rest="${out#* }"; size="${rest%% *}"; time="${rest##* }"
     case "$out" in *' '*) ;; *) size=""; time="" ;; esac
     case "$code" in ''|*[!0-9]*) code=000 ;; esac
@@ -185,12 +192,13 @@ z2r_tls_version_state() {
 
 # 206/2xx/3xx + rc=0 и любые байты > 0 — тело дошло целиком (страница может
 # быть просто меньше запрошенных 64КБ). Обрыв ("cut") — только когда байты
-# пошли, но curl закончился ошибкой.
+# пошли, но curl закончился ошибкой, не добрав запрошенного: сервер без
+# поддержки Range шлёт всю страницу (~1 МБ), и таймаут после 64КБ — не срез.
 z2r_tls_download_state() {
     local rc="$1" code="$2" size="$3"
     if [ "$code" = "206" ] || z2r_tls_code_ok "$code"; then
         if [ "$size" -gt 0 ]; then
-            if [ "$rc" -eq 0 ]; then echo ok; else echo cut; fi
+            if [ "$rc" -eq 0 ] || [ "$size" -ge "${Z2R_TLS_DL_RANGE:-65536}" ]; then echo ok; else echo cut; fi
         else
             echo zero
         fi
@@ -230,7 +238,7 @@ z2r_tls_poll_sleep() {
 
 z2r_tls_check_target() (
     local url="$1" tmp v12 v13 dl dl1 dl2 p12 p13 d1_pid d2_pid peek t0 tls_gap pids
-    local rc code rc13 code13 size time unused Z2R_TLS_POLL_INTERVAL
+    local rc code rc13 code13 size time unused Z2R_TLS_POLL_INTERVAL dlflags=""
     z2r_poll_sleep_init
     Z2R_TLS_POLL_INTERVAL="$(z2r_poll_interval 0.3)"
     tmp="$(z2r_tls_tmpdir)" || return 1
@@ -290,7 +298,10 @@ z2r_tls_check_target() (
     IFS='|' read -r rc code unused <<< "$v12"
     IFS='|' read -r rc13 code13 unused <<< "$v13"
     if z2r_tls_code_ok "$code" || z2r_tls_code_ok "$code13"; then
-        z2r_tls_probe_download "$url" >"$tmp/d1" 2>/dev/null </dev/null &
+        # 2xx/3xx только у TLS 1.2: качаем им же — дефолтный curl предложит
+        # TLS 1.3, и стратегия «только TLS 1.2» ложно станет красной
+        z2r_tls_code_ok "$code13" || dlflags="--tlsv1.2 --tls-max 1.2"
+        z2r_tls_probe_download "$url" $dlflags >"$tmp/d1" 2>/dev/null </dev/null &
         d1_pid=$!
         wait "$d1_pid" 2>/dev/null || true
         dl1="$(cat "$tmp/d1" 2>/dev/null)" || dl1=""
@@ -298,7 +309,7 @@ z2r_tls_check_target() (
         dl="$dl1"
         IFS='|' read -r rc code size time unused <<< "$dl1"
         if [ "$(z2r_tls_download_state "$rc" "$code" "$size")" != "ok" ]; then
-            z2r_tls_probe_download "$url" >"$tmp/d2" 2>/dev/null </dev/null &
+            z2r_tls_probe_download "$url" $dlflags >"$tmp/d2" 2>/dev/null </dev/null &
             d2_pid=$!
             wait "$d1_pid" "$d2_pid" 2>/dev/null || true
             dl2="$(cat "$tmp/d2" 2>/dev/null)" || dl2=""
@@ -419,6 +430,11 @@ z2r_tls_target_verdict() {
         return
     fi
     if ! z2r_tls_code_ok "$code12" && ! z2r_tls_code_ok "$code13"; then
+        # googlevideo (404 на корне) идёт именно сюда: зелёный — только с TLS 1.3
+        if [ "$t13" -eq 0 ] && [ "$s13" != aborted ]; then
+            printf 'warn|Сайт отвечает только по TLS 1.2 — TLS 1.3 недоступен, современные браузеры могут не открыться. Проверьте вручную.'
+            return
+        fi
         if [ "$t12" -eq 1 ]; then best="$code12"; else best="$code13"; fi
         printf 'ok|Доступ есть: TLS работает, сервер ответил кодом %s.' "$best"
         return
@@ -439,7 +455,9 @@ z2r_tls_target_verdict() {
             return
         fi
     fi
-    if [ "$t13" -eq 0 ]; then
+    # aborted = TLS 1.3 добит, потому что TLS 1.2 ответил раньше: «не проверен»,
+    # а не «недоступен»
+    if [ "$t13" -eq 0 ] && [ "$s13" != aborted ]; then
         printf 'warn|Сайт отвечает только по TLS 1.2 — TLS 1.3 недоступен, современные браузеры могут не открыться. Проверьте вручную.'
         return
     fi
@@ -522,25 +540,27 @@ z2r_tls_short_result() {
                     printf 'warn|срез нестабильный, повтор прошёл\n'
                     return
                 fi
+                # версии — по t12/t13: любой HTTP-код = сервер ответил
+                # (200 + 404 не хуже, чем 404 + 404 выше)
                 case "$pref" in
                     both)
-                        if [ "$q12" -eq 1 ] && [ "$q13" -eq 1 ]; then
+                        if [ "$t12" -eq 1 ] && [ "$t13" -eq 1 ]; then
                             printf 'ok|данные %s байт за %s с\n' "$dlsize" "$dltime"
-                        elif [ "$q12" -eq 1 ]; then
+                        elif [ "$t12" -eq 1 ]; then
                             printf 'warn|работает только TLS 1.2, данные %s байт за %s с\n' "$dlsize" "$dltime"
                         else
                             printf 'warn|работает только TLS 1.3, данные %s байт за %s с\n' "$dlsize" "$dltime"
                         fi
                         ;;
                     12)
-                        if [ "$q12" -eq 1 ]; then
+                        if [ "$t12" -eq 1 ]; then
                             printf 'ok|данные %s байт за %s с\n' "$dlsize" "$dltime"
                         else
                             printf 'warn|работает только TLS 1.3, данные %s байт за %s с\n' "$dlsize" "$dltime"
                         fi
                         ;;
                     13)
-                        if [ "$q13" -eq 1 ]; then
+                        if [ "$t13" -eq 1 ]; then
                             printf 'ok|данные %s байт за %s с\n' "$dlsize" "$dltime"
                         else
                             printf 'warn|работает только TLS 1.2, данные %s байт за %s с\n' "$dlsize" "$dltime"
@@ -674,10 +694,15 @@ z2r_dns_check_target() {
     fi
 
     case "$out" in
+        # «** server can't find X: SERVFAIL» — сбой резолвера, не подмена:
+        # проверяется раньше общего «can't find»
+        *SERVFAIL*|*REFUSED*)
+            printf 'fail|noanswer||||\n'
+            ;;
         *NXDOMAIN*|*"not found"*|*"can't find"*|*"Non-existent"*|*"no answer"*)
             printf 'fail|nxdomain||||\n'
             ;;
-        *"timed out"*|*"timeout"*|*"no servers"*|*"refused"*|*"unreachable"*|*"SERVFAIL"*|*"connection"*|*"Failure"*)
+        *"timed out"*|*"timeout"*|*"no servers"*|*"refused"*|*"unreachable"*|*"connection"*|*"Failure"*)
             printf 'fail|noanswer||||\n'
             ;;
         *)
@@ -925,17 +950,19 @@ z2r_doh_a_lookup() {
 # подмену даже при полном совпадении.
 z2r_doh_reference() {
     local domain="$1" raw ips
+    # Только "data" из Answer: в "Comment" dns.google кладёт IP
+    # авторитативного NS ("Response from 172.64.33.78.") — это не эталон.
     raw="$(curl -s -A "$Z2R_CURL_UA" --max-time "${Z2R_DNS_DOH_TIMEOUT:-6}" \
         "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null)"
     if [ -n "$raw" ]; then
-        ips="$(printf '%s\n' "$raw" | grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ')"
+        ips="$(printf '%s\n' "$raw" | grep -o '"data": *"[0-9.]*"' | grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ')"
         ips="${ips% }"
         [ -n "$ips" ] && { printf 'Google DoH (dns.google)|%s\n' "$ips"; return 0; }
     fi
     raw="$(curl -sk -A "$Z2R_CURL_UA" --max-time "${Z2R_DNS_DOH_TIMEOUT:-6}" \
         "https://8.8.8.8/resolve?name=${domain}&type=A" 2>/dev/null)"
     if [ -n "$raw" ]; then
-        ips="$(printf '%s\n' "$raw" | grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ')"
+        ips="$(printf '%s\n' "$raw" | grep -o '"data": *"[0-9.]*"' | grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ')"
         ips="${ips% }"
         [ -n "$ips" ] && { printf 'Google DoH (8.8.8.8)|%s\n' "$ips"; return 0; }
     fi
@@ -971,9 +998,11 @@ z2r_dns_spoof_gate() {
     fi
     echo -e "Эталон (${ref_src:-все резолверы недоступны}): ${ref:-—}"
     # системный резолвер: адрес самого сервера из шапки исключаем, чтобы
-    # он не попал в список ответов
+    # он не попал в список ответов. Шапка: «Address:» или «Address 1:»
+    # (BusyBox до 1.28, Merlin) — только до первого «Name:», иначе при
+    # IPv6-шапке («Address 1: ::1») исключился бы первый ответ
     raw="$(nslookup "$domain" 2>/dev/null)"
-    srv="$(printf '%s\n' "$raw" | sed -n 's/^Address:[[:space:]]*\([0-9][0-9.]*\).*$/\1/p' | head -n1)"
+    srv="$(printf '%s\n' "$raw" | sed -n '/^Name:/q;s/^Address[ 0-9]*:[[:space:]]*\([0-9][0-9.]*\).*$/\1/p' | head -n1)"
     parsed="$(printf '%s\n' "$raw" | z2r_dns_parse_addrs "$srv")"
     sys="$(z2r_dns_field "$parsed" 1)"
     echo -e "Системный DNS (nslookup ${domain}): ${sys:-нет IPv4 в ответе}"
@@ -988,6 +1017,8 @@ z2r_dns_spoof_gate() {
         return 0
     fi
     case "$raw" in
+        # SERVFAIL/REFUSED — сбой резолвера («не отвечает» ниже, rc=1), не NXDOMAIN
+        *SERVFAIL*|*REFUSED*) ;;
         *NXDOMAIN*|*"can't find"*|*"not found"*)
             echo -e "${red:-}СИСТЕМНЫЙ DNS ПОДМЕНЁН/СЛОМАН: отвечает NXDOMAIN на существующий домен.${plain:-}"
             echo -e "${red:-}Подбор стратегий бессмысленен — все пробы прогона не смогут отрезолвить цели.${plain:-}"
@@ -1171,14 +1202,16 @@ check_dns() {
 }
 
 check_access_list() {
+   local gv
    if ! check_dns "rutracker.org"; then
       echo -e "${yellow}DNS-проверка завершилась предупреждением, продолжаю остальные тесты.${plain}"
    fi
 
    echo "Проверка доступности youtube.com (YT TCP)"
    check_access "https://www.youtube.com/"
-   echo "Проверка доступности $(get_yt_cluster_domain) (YT TCP)"
-   check_access "https://$(get_yt_cluster_domain)"
+   gv="$(get_yt_cluster_domain)"
+   echo "Проверка доступности $gv (YT TCP)"
+   check_access "https://$gv"
    echo "Проверка доступности meduza.io (RKN list)"
    check_access "https://meduza.io"
    echo "Проверка доступности www.instagram.com (RKN list + нужен рабочий DNS)"

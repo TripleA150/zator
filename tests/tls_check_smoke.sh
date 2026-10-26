@@ -177,6 +177,10 @@ chmod +x "$TMP_DIR/bin/dig"
 export COUNTER_DIR="$TMP_DIR/counter"
 export PATH="$TMP_DIR/bin:$PATH"
 export TMPDIR="$TMP_DIR"
+# Ожидание TTL кеша Lua после записи лока: Lua здесь нет, ждать незачем.
+export Z2R_SUPERSWEEP_SETTLE=0
+# История автопрогона и провайдер — только во временной папке (не /opt).
+export ORCH_DIR="$TMP_DIR/orch" PROVIDER_CACHE="$TMP_DIR/no_provider.txt"
 
 for f in lib/netcheck.sh lib/strategies.sh webui/cgi-bin/_lib.sh z2r.sh lua/strategy-validator.sh; do
   bash -n "$REPO_DIR/$f" || fail "синтаксис $f"
@@ -661,6 +665,152 @@ printf '%s' "$cli_out" | grep -q "Проверьте доступность вр
     || fail "сценарий 14d: лок не восстановлен после прерывания в паузе"
 )
 
+# == 14f. порядок кандидатов (рекомендации -> история -> остальные) и
+#          подтверждение зелёной повторной пробой ==
+(
+  export ORCH_DIR="$TMP_DIR/orch14f"
+  export ORCH_LOCK_FILE="$ORCH_DIR/locked.tsv"
+  export PROFILE_STATE_FILE="$TMP_DIR/profile_14f.lock"
+  export PROVIDER_CACHE="$TMP_DIR/provider14f.txt"
+  export RECS_FILE="$TMP_DIR/recs14f.tsv"
+  export Z2R_SWEEP_PAUSE=0
+  mkdir -p "$ORCH_DIR"; : > "$ORCH_LOCK_FILE"
+  plain="" green="" yellow="" red="" cyan="" Fgreen=""
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/orchestra_state.sh"
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/recommendations.sh"
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/strategies.sh"
+  hist="$(orch_sweep_history_file)"
+  [ "$hist" = "$ORCH_DIR/sweep_history.tsv" ] || fail "сценарий 14f: история не в ORCH_DIR: $hist"
+
+  recs() { # recs <провайдер>: валидный кеш, профили 1 и 3 рекомендуют 7, затем 3
+    printf 'meta\t1\t%s\t10\t1700000000\n' "$1" > "$RECS_FILE"
+    for p in 1 2 3 4; do printf 'profile\t%s\t10\t0\t40\t70\n' "$p" >> "$RECS_FILE"; done
+    for p in 1 3; do
+      printf 'strategy\t%s\t7\t80\t10\tmixed\n' "$p" >> "$RECS_FILE"
+      printf 'strategy\t%s\t3\t70\t9\tclassic\n' "$p" >> "$RECS_FILE"
+    done
+  }
+  now="$(date +%s)"
+  printf 'TestISP\n' > "$PROVIDER_CACHE"
+  recs TestISP
+  {
+    printf '%s\tTestISP\t2\t5\tok\n' "$now"            # шаблон-сосед (вес 0.5)
+    printf '%s\tTestISP\t1\t99\tok\n' "$now"           # вне диапазона
+    printf '%s\tTestISP\t4\t8\tok\n' "$now"            # Discord — не сосед
+    printf '%s\tOtherISP\t1\t9\tok\n' "$now"           # чужой провайдер
+    printf 'garbage\tTestISP\t1\t6\tok\n'
+    printf '%s\tTestISP\t1\t6\tmaybe\n' "$now"
+    printf '%s\tTestISP\t1\tx6\tok\n' "$now"
+    printf '%s\tTestISP\t1\t6\tok\textra\n' "$now"
+  } > "$hist"
+  got="$(orch_sweep_order 1 1 10)"
+  [ "$got" = "7 3 5 1 2 4 6 8 9 10" ] || fail "сценарий 14f: порядок рекомендации->история->остальные: $got"
+  [ "$(printf '%s\n' "$got" | tr ' ' '\n' | sort -n | uniq | wc -l | tr -d ' ')" = "10" ] \
+    || fail "сценарий 14f: порядок не перестановка 1..10: $got"
+  # рекомендация за пределами диапазона отсекается, перестановка сохраняется
+  got="$(orch_sweep_order 1 4 8)"
+  [ "$got" = "7 5 4 6 8" ] || fail "сценарий 14f: диапазон 4-8: $got"
+
+  # кеш чужого провайдера и битый кеш игнорируются; история — своего провайдера
+  printf 'OtherISP\n' > "$PROVIDER_CACHE"
+  got="$(orch_sweep_order 1 1 10)"
+  [ "$got" = "9 1 2 3 4 5 6 7 8 10" ] || fail "сценарий 14f: кеш чужого провайдера не игнорирован: $got"
+  printf 'TestISP\n' > "$PROVIDER_CACHE"
+  printf 'strategy\t1\t1\t101\t10\tclassic\n' >> "$RECS_FILE"
+  got="$(orch_sweep_order 1 1 10)"
+  [ "$got" = "5 1 2 3 4 6 7 8 9 10" ] || fail "сценарий 14f: битый кеш рекомендаций не игнорирован: $got"
+  : > "$RECS_FILE"
+
+  # полураспад: свежий успех выше двух старых; свежий провал гасит старый успех
+  {
+    printf '%s\tTestISP\t4\t4\tok\n' "$((now - 60 * 86400))"
+    printf '%s\tTestISP\t4\t4\tok\n' "$((now - 60 * 86400))"
+    printf '%s\tTestISP\t4\t6\tok\n' "$now"
+    printf '%s\tTestISP\t4\t2\tok\n' "$((now - 30 * 86400))"
+    printf '%s\tTestISP\t4\t2\tfail\n' "$now"
+  } > "$hist"
+  got="$(orch_sweep_order 4 1 6)"
+  [ "$got" = "6 4 1 2 3 5" ] || fail "сценарий 14f: убывание истории: $got"
+
+  # запись истории: мусор и неизвестный провайдер не пишутся, файл ограничен
+  : > "$hist"
+  orch_sweep_history_add 1 abc ok; orch_sweep_history_add 1 5 maybe; orch_sweep_history_add x 5 ok
+  [ ! -s "$hist" ] || fail "сценарий 14f: мусор попал в историю: $(cat "$hist")"
+  printf 'Не определён\n' > "$PROVIDER_CACHE"
+  orch_sweep_history_add 1 5 ok
+  [ ! -s "$hist" ] || fail "сценарий 14f: история без провайдера"
+  printf 'TestISP\n' > "$PROVIDER_CACHE"
+  orch_sweep_history_add 01 08 ok
+  awk -F'\t' 'NF==5 && $2=="TestISP" && $3=="1" && $4=="8" && $5=="ok"' "$hist" | grep -q . \
+    || fail "сценарий 14f: строка истории не записана: $(cat "$hist")"
+  awk -v t="$now" 'BEGIN { for (i=0; i<3000; i++) printf "%s\tTestISP\t1\t1\tfail\n", t }' > "$hist"
+  orch_sweep_history_add 1 2 ok
+  [ "$(wc -l < "$hist" | tr -d ' ')" -le 3000 ] || fail "сценарий 14f: история не урезана"
+  tail -n1 "$hist" | grep -q "$(printf '\t2\tok')" || fail "сценарий 14f: после урезания потеряна свежая строка"
+
+  # мок curl по реальному локу: зелёные — MOCK14F_GREEN, MOCK14F_FLAKY зелёная
+  # только при первой пробе (TLS 1.2 всегда молчит, цель any)
+  mkdir -p "$TMP_DIR/bin14f"
+  cat > "$TMP_DIR/bin14f/curl" <<'MOCKF'
+#!/bin/sh
+hdr=""; head=0; ver=""; prev=""
+for arg in "$@"; do
+  [ "$prev" = "-D" ] && hdr="$arg"
+  [ "$arg" = "-I" ] && head=1
+  case "$arg" in --tlsv1.3) ver=13 ;; --tlsv1.2) ver=12 ;; esac
+  prev="$arg"
+done
+[ "$head" = 1 ] || { echo "206 65536 1.000"; exit 0; }
+[ "$ver" = 13 ] || { echo "8.004 -"; exit 28; }
+s="$(awk -F'\t' '$1=="example.org" && $2=="tls" {v=$3} END {print v}' "$ORCH_LOCK_FILE")"
+n=1; [ -f "$COUNTER_DIR/p_$s" ] && n=$(( $(cat "$COUNTER_DIR/p_$s") + 1 )); echo "$n" > "$COUNTER_DIR/p_$s"
+ok=0
+case " $MOCK14F_GREEN " in *" $s "*) ok=1 ;; esac
+[ "$s" = "${MOCK14F_FLAKY:-}" ] && [ "$n" = 1 ] && ok=1
+if [ "$ok" = 1 ]; then [ -n "$hdr" ] && printf 'HTTP/2 200\r\n' >"$hdr"; echo "0.500 192.0.2.10"; exit 0; fi
+echo "8.004 -"; exit 28
+MOCKF
+  chmod +x "$TMP_DIR/bin14f/curl"
+  export PATH="$TMP_DIR/bin14f:$PATH"
+  : > "$hist"
+  recs TestISP
+
+  # до первого успеха: первой идёт рекомендованная 7, повтор подтверждает
+  reset_counter
+  export MOCK14F_GREEN="7" MOCK14F_FLAKY=""
+  out="$(printf '\n' | orch_auto_sweep domain example.org tls https://example.org/ 1 10 1)"
+  [ "$(orch_locked_get example.org tls)" = "7" ] || fail "сценарий 14f: Enter не сохранил 7: $out"
+  [ "$(ls "$COUNTER_DIR" | tr '\n' ' ')" = "p_7 " ] || fail "сценарий 14f: проверялась не только 7: $(ls "$COUNTER_DIR")"
+  [ "$(cat "$COUNTER_DIR/p_7")" = "2" ] || fail "сценарий 14f: нет повторной пробы победителя"
+  printf '%s' "$out" | grep -q "подтверждена повторной проверкой" || fail "сценарий 14f: нет подтверждения: $out"
+  printf '%s' "$out" | grep -q "Сначала рекомендованные и успешные ранее: 7 3" || fail "сценарий 14f: шапка без порядка: $out"
+  [ "$(awk -F'\t' '$2=="TestISP" && $3=="3" && $4=="7" && $5=="ok"' "$hist" | wc -l | tr -d ' ')" = "2" ] \
+    || fail "сценарий 14f: история проб (профиль 3) не записана: $(cat "$hist")"
+
+  # нестабильная 7 (повтор красный) — прогон идёт дальше, Enter берёт подтверждённую 3
+  reset_counter; : > "$hist"
+  export MOCK14F_GREEN="3" MOCK14F_FLAKY="7"
+  out="$(printf '\n' | orch_auto_sweep domain example.org tls https://example.org/ 1 10 1)"
+  printf '%s' "$out" | grep -q "  7: НЕСТАБИЛЬНА" || fail "сценарий 14f: 7 не помечена нестабильной: $out"
+  [ "$(orch_locked_get example.org tls)" = "3" ] || fail "сценарий 14f: Enter должен взять подтверждённую 3: $out"
+  printf '%s' "$out" | grep -q "Нестабильные (повтор не прошёл): 7" || fail "сценарий 14f: сводка без нестабильных: $out"
+
+  # полный прогон: лучшая 7 не подтвердилась — сводка говорит, Enter=лучшая
+  reset_counter
+  out="$(printf '\n' | orch_auto_sweep domain example.org tls https://example.org/ 1 10 0)"
+  printf '%s' "$out" | grep -q "Лучшая 7 не подтвердилась" || fail "сценарий 14f: полный прогон без пометки: $out"
+  [ "$(cat "$COUNTER_DIR/p_7")" = "2" ] || fail "сценарий 14f: лучшая не перепроверена"
+  [ "$(orch_locked_get example.org tls)" = "7" ] || fail "сценарий 14f: Enter=лучшая сломан"
+  reset_counter
+  export MOCK14F_GREEN="3 7" MOCK14F_FLAKY=""
+  out="$(printf '0\n' | orch_auto_sweep domain example.org tls https://example.org/ 1 10 0)"
+  printf '%s' "$out" | grep -q "Стратегия 7 подтверждена повторной проверкой" || fail "сценарий 14f: нет подтверждения в полном: $out"
+  [ "$(orch_locked_get example.org tls)" = "7" ] || fail "сценарий 14f: 0 не вернул прежний лок"
+)
+
 # == 14e. статика: рестарты через z2r_service_action, run_daemon отвязан от терминала ==
 (
   src_line="$(grep -n '^\. "\$EXEDIR/functions"' "$REPO_DIR/Entware/zapret" | cut -d: -f1)"
@@ -801,6 +951,16 @@ printf '%s' "$cli_out" | grep -q "Проверьте доступность вр
   export MOCK_VALIDATOR_RC=28
   mk_req 4; run_val 4
   [ "$(res_status 4)" = "ERROR" ] || fail "сценарий 17: после OK счётчик должен считаться заново (ERROR)"
+
+  # Не-DPI ошибки (сертификат, CA-бандл, закрытый порт) не блокируют стратегию.
+  for rc in 7 60 77; do
+    export MOCK_VALIDATOR_RC=$rc
+    mk_req "5$rc"; run_val "5$rc"
+    [ "$(res_status "5$rc")" = "ERROR" ] || fail "сценарий 17: rc=$rc должен быть ERROR, получено: $(res_status "5$rc")"
+  done
+  export MOCK_VALIDATOR_RC=35
+  mk_req 6; run_val 6
+  [ "$(res_status 6)" = "FAIL" ] || fail "сценарий 17: обрыв TLS (rc=35) должен быть FAIL"
   unset MOCK_VALIDATOR_RC
 )
 

@@ -12,7 +12,15 @@ JSON, `Content-Type: application/json; charset=utf-8`.
 для `GET` — из `QUERY_STRING`, для `POST` — из тела (`Content-Length`,
 `application/x-www-form-urlencoded`). Распознаются ключи `profile`,
 `strategy`, `action`, `setting`, `value`, `list`, `domain`, `name`, `city`,
-`proto`, `scope`. Значения URL-декодируются (`%xx` → символ, `+` → пробел).
+`proto`, `restart`, `scope`. Значения URL-декодируются (`%xx` → символ, `+` → пробел).
+
+Защита от CSRF (`require_post_same_origin`): `set-lock`, `clear-lock` и
+`service` принимают только `POST` (иначе `405` `Только POST`); у каждого
+мутирующего `POST` (`set-lock`, `clear-lock`, `service`, `settings`,
+`domains`, `backups`) хост из `Origin` (а без него — из `Referer`) обязан
+совпасть с `Host`, иначе `403` `Чужой источник запроса`. Нет обоих
+заголовков (httpd их не передал) — запрос пропускается. `check` и все `GET`
+чтения не проверяются.
 
 Client scope: `scope` необязателен и по умолчанию равен `default`; допустимы только `default` и `mark:<decimal>`. Эндпоинт `GET /cgi-bin/scopes.cgi` возвращает `{enabled, warning, scopes}`. Поля профиля `scope` и `lock_source` показывают effective layer: `scoped`, `default`, `auto` или `conflict`.
 
@@ -30,6 +38,7 @@ Client scope: `scope` необязателен и по умолчанию рав
 | `locked.manual.tsv` | `$ORCH_DIR/locked.manual.tsv` | используется профилями 8/9 в `config.sh` |
 | `PROFILE_STATE_FILE` | `/opt/etc/z2r/profile.lock` (default) | [`orchestra_state.sh:5`](../../lib/orchestra_state.sh:5) (env `Z2R_PROFILE_STATE_FILE`) |
 | Порт WebUI | `17682` (env `WEBUI_PORT`) | [`run-webui.sh:13`](../run-webui.sh:13) |
+| Адрес привязки | `0.0.0.0` (env `WEBUI_BIND`, напр. `127.0.0.1` на VPS) | [`run-webui.sh:16`](../run-webui.sh:16) |
 | Поиск runtime-либ | `$ZAPRET_ROOT/z2r_lib`, `../../z2r_lib`, `../../lib`, `../lib` | [`_lib.sh:14`](../cgi-bin/_lib.sh:14) |
 
 > Фейк-сервер **никогда** не лезет в эти пути: всё переопределяется во
@@ -240,6 +249,10 @@ ipfrag (по клону), repeats, udplen (паддинг оригинала). i
 Каждый элемент результата — общий формат проверки цели (см. [§5](#5-post-cgi-bincheckcgi--api_check)).
 `tls12`/`tls13` —legacy-булевы (транспорт ответил любым HTTP-кодом), `verdict` —
 `ok|warn|fail`, `download: null` — этап данных пропущен (не было 2xx/3xx на HEAD).
+
+> `scope=mark:N`: пишется только per-mark лок на **каждый** протокол профиля
+> (`profile_state_set_and_apply` с `ORCH_ACTIVE_SCOPE`, как в CLI; профиль 1 —
+> и `tls`, и `http`), config не трогается. То же для `clear-lock`.
 
 > Для профиля 6 дополнительно выполняется `service_zapret2 restart` (результат
 > игнорируется) и правка голосовых портов в конфиге.
@@ -828,6 +841,11 @@ CLI-логики в [`_lib.sh`](../cgi-bin/_lib.sh) (`netrogat_file`, `custom_rk
 Списки исключений (`netrogat`, `netrogat_substring`) ограничению не подлежат;
 `remove`/`clear`/`set_strategy` доступны всегда.
 
+**500 Internal Server Error**: `set_strategy` — `Не удалось сохранить стратегию
+домена`, `clear_strategy` — `Не удалось сбросить стратегию домена` (lock-файл
+не записан: таймаут write-lock, ключ отвергнут `orch_scope_validate`).
+Управляющие символы (TAB и т.п.) в подстроках и в `provider_set` вырезаются.
+
 Метод не из {GET,POST} → `405` `Метод не поддерживается`.
 
 > Ответы доменных действий **не содержат** `restarted` (списки не требуют
@@ -854,7 +872,7 @@ CLI-логики в [`_lib.sh`](../cgi-bin/_lib.sh) (`netrogat_file`, `custom_rk
 ```
 
 `date` разбирается из имени файла (`z2r_backup_YYYYmmdd_HHMMSS.tar`), `size` —
-байты.
+байты. Порядок — новые сверху (свёрнутая панель показывает первые 4).
 
 ### GET `?action=download&name=<архив>` → `api_backups_download`
 

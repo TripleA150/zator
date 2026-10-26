@@ -1,6 +1,6 @@
 -- Custom failure detector for TCP silent drop (DPI drops packets without RST)
--- Works by counting outgoing vs incoming DATA packets (excluding SYN-ACK handshake)
--- If many outgoing data packets and few incoming data = failure
+-- Works by counting outgoing DATA packets vs any incoming packets (ACKs included)
+-- If many outgoing data packets and no incoming progress = failure
 --
 -- Uses the shared stall-baseline helpers from combined-detector.lua (this
 -- file must load after it - see combined_silent_drop_detector below) so the
@@ -26,9 +26,10 @@ function silent_drop_detector(desync, crec, arg)
     end
 
     if desync.dis.tcp and desync.outgoing and desync.track then
-        -- Use dcounter (data packets) if available, otherwise pcounter
+        -- Outgoing: dcounter (data packets) if available, otherwise pcounter.
+        -- Incoming: pcounter, so pure ACKs of an upload count as progress.
         local out_count = desync.track.pos.direct.dcounter or desync.track.pos.direct.pcounter or 0
-        local in_count = desync.track.pos.reverse.dcounter or desync.track.pos.reverse.pcounter or 0
+        local in_count = desync.track.pos.reverse.pcounter or desync.track.pos.reverse.dcounter or 0
 
         -- Baseline = the (out,in) snapshot taken the last time we saw the peer
         -- make progress (in_count increase). This lets us detect a stall that

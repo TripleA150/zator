@@ -17,6 +17,7 @@ json_escape() {
   {
     gsub(/\\/, "\\\\")
     gsub(/"/, "\\\"")
+    gsub(/\t/, "\\t")
     gsub(/\r/, "")
     if (NR>1) printf "\\n"
     printf "%s", $0
@@ -36,6 +37,20 @@ send_error() {
   local message="$2"
   send_json "$status" "{\"error\":\"$(json_escape "$message")\"}"
   exit 0
+}
+
+# Защита мутирующих эндпоинтов от CSRF: только POST, а пришедший Origin
+# (или Referer) обязан указывать на тот же хост, что и Host. Не каждый httpd
+# экспортирует эти заголовки — их отсутствие пропускаем.
+require_post_same_origin() {
+  [ "${REQUEST_METHOD:-GET}" = POST ] || send_error "405 Method Not Allowed" "Только POST"
+  local o="${HTTP_ORIGIN:-${HTTP_REFERER:-}}"
+  # Host браузер шлёт всегда: пустой HTTP_HOST — httpd его не экспортировал,
+  # сравнивать не с чем (иначе 403 на каждый POST панели).
+  [ -n "$o" ] && [ -n "${HTTP_HOST:-}" ] || return 0
+  o="${o#*://}"
+  o="${o%%/*}"
+  [ "$o" = "${HTTP_HOST:-}" ] || send_error "403 Forbidden" "Чужой источник запроса"
 }
 
 api_supersweep_get() {
@@ -108,6 +123,7 @@ parse_params() {
   PARAM_NAME=""
   PARAM_CITY=""
   PARAM_PROTO=""
+  PARAM_RESTART=""
   PARAM_SCOPE="default"
   IFS='&' read -r -a parts <<< "$raw"
   for part in "${parts[@]}"; do
@@ -127,6 +143,7 @@ parse_params() {
       name) PARAM_NAME="$value" ;;
       city) PARAM_CITY="$value" ;;
       proto) PARAM_PROTO="$value" ;;
+      restart) PARAM_RESTART="$value" ;;
       scope) PARAM_SCOPE="${value:-default}" ;;
     esac
   done
@@ -167,6 +184,7 @@ orch_max_strategy_for_profile() {
 _json_esc() {
   REPLY="${1//\\/\\\\}"
   REPLY="${REPLY//\"/\\\"}"
+  REPLY="${REPLY//$'\t'/\\t}"
 }
 
 # Пакетное чтение lock-состояний профилей: один проход по файлам
@@ -497,7 +515,7 @@ _provider_cache_text() {
 
 _client_scope_diagnostics_state() {
   local enabled mask shift max desync postnat mask_n shift_n max_n desync_n postnat_n mode reason
-  local mask_json shift_json max_json scoped_count conflicts file manual_file
+  local mask_json shift_json max_json scoped_count conflicts f
   enabled="$(config_get_var "$CONFIG_FILE" CLIENT_SCOPE_ENABLE 2>/dev/null || printf 0)"
   mask="$(config_get_var "$CONFIG_FILE" CLIENT_SCOPE_MARK_MASK 2>/dev/null || true)"
   shift="$(config_get_var "$CONFIG_FILE" CLIENT_SCOPE_MARK_SHIFT 2>/dev/null || printf 0)"
@@ -536,9 +554,17 @@ _client_scope_diagnostics_state() {
        max_n="$(config_client_scope_num "$max" 2>/dev/null)"; then
     mask_json="$mask_n"; shift_json="$shift_n"; max_json="$max_n"
   fi
-  file="$ORCH_DIR/locked.tsv"; manual_file="$ORCH_DIR/locked.manual.tsv"
-  scoped_count="$(awk -F '\t' '$1 ~ /^mark:[0-9]+$/ && NF >= 4 {n++} END {print n+0}' "$file" "$manual_file" 2>/dev/null)"
-  conflicts="$(awk -F '\t' '$1 ~ /^mark:[0-9]+$/ && NF >= 4 {key=$1 SUBSEP $2 SUBSEP $3; seen[key SUBSEP $4]=1} END {for (item in seen) {split(item, fields, SUBSEP); keys[fields[1] SUBSEP fields[2] SUBSEP fields[3]]++} for (key in keys) if (keys[key] > 1) n++} END {print n+0}' "$file" "$manual_file" 2>/dev/null)"
+  # Scoped-локи живут в per-mark файлах scopes/mark_N.tsv; 4-колоночные
+  # mark:-строки locked*.tsv — ещё не промигрированный легаси-формат.
+  # Только существующие файлы: busybox awk падает на отсутствующем.
+  set --
+  for f in "$ORCH_DIR/locked.tsv" "$ORCH_DIR/locked.manual.tsv" "$ORCH_DIR"/scopes/mark_*.tsv; do
+    [ -f "$f" ] && set -- "$@" "$f"
+  done
+  IFS='|' read -r scoped_count conflicts <<< "$(awk -F '\t' '
+    FILENAME ~ /\/mark_[0-9]+\.tsv$/ {if (NF >= 3) {n++; c[FILENAME SUBSEP $1 SUBSEP $2]++}; next}
+    $1 ~ /^mark:[0-9]+$/ && NF >= 4 {n++; c[$1 SUBSEP $2 SUBSEP $3]++}
+    END {for (k in c) if (c[k] > 1) d++; print (n + 0) "|" (d + 0)}' "$@" </dev/null 2>/dev/null)"
   printf '%s|%s|%s|%s|%s|%s|%s\n' \
     "$mode" "$mask_json" "$shift_json" "$max_json" "${scoped_count:-0}" "${conflicts:-0}" "$reason"
 }
@@ -726,8 +752,9 @@ api_state() {
     v_ws="$(deploy_version_field WEBUI_SHA)"
     v_lz="$(deploy_latest_field LATEST_ZATOR_SHA)"
     v_lw="$(deploy_latest_field LATEST_WEBUI_SHA)"
-    if { [ -n "$v_lz" ] && [ -n "$v_zs" ] && [ "$v_zs" != "$v_lz" ]; } \
-      || { [ -n "$v_lw" ] && [ -n "$v_ws" ] && [ "$v_ws" != "$v_lw" ]; }; then
+    # пустой локальный SHA (raw-установка) = версия неизвестна, как в CLI (lib/deploy.sh)
+    if { [ -n "$v_lz" ] && [ "$v_zs" != "$v_lz" ]; } \
+      || { [ -n "$v_lw" ] && [ "$v_ws" != "$v_lw" ]; }; then
       v_update=true
     fi
     _json_esc "$v_zator_ver"; local j_zver="$REPLY"
@@ -748,6 +775,7 @@ EOF
 }
 
 api_set_lock() {
+  require_post_same_origin
   parse_params
   [[ "${PARAM_PROFILE:-}" =~ ^[1-9][0-9]*$ ]] || send_error "400 Bad Request" "Некорректный профиль"
   [[ "${PARAM_STRATEGY:-}" =~ ^[0-9]+$ ]] || send_error "400 Bad Request" "Некорректная стратегия"
@@ -770,7 +798,8 @@ api_set_lock() {
   if [ "$requested_scope" = default ]; then
     profile_state_set_and_apply "$PARAM_PROFILE" "$proto_list" "$PARAM_STRATEGY" "$CONFIG_FILE" || send_error "500 Internal Server Error" "Не удалось сохранить состояние профиля"
   else
-    orch_scoped_locked_set "$requested_scope" "$PARAM_PROFILE" "${proto_list%% *}" "$PARAM_STRATEGY" || send_error "500 Internal Server Error" "Не удалось сохранить scoped lock"
+    # Как CLI: per-mark лок на каждый протокол профиля, config не трогаем.
+    ORCH_ACTIVE_SCOPE="$requested_scope" profile_state_set_and_apply "$PARAM_PROFILE" "$proto_list" "$PARAM_STRATEGY" "$CONFIG_FILE" || send_error "500 Internal Server Error" "Не удалось сохранить scoped lock"
   fi
   profile_config_voice_ports_changed "$PARAM_PROFILE" "$CONFIG_FILE" "$old_udp_ports" && service_zapret2 restart >/dev/null 2>&1 || true
   telemetry_notify
@@ -778,6 +807,7 @@ api_set_lock() {
 }
 
 api_clear_lock() {
+  require_post_same_origin
   parse_params
   [[ "${PARAM_PROFILE:-}" =~ ^[1-9][0-9]*$ ]] || send_error "400 Bad Request" "Некорректный профиль"
   case "$PARAM_PROFILE" in
@@ -794,7 +824,7 @@ api_clear_lock() {
   if [ "$requested_scope" = default ]; then
     profile_state_set_and_apply "$PARAM_PROFILE" "$proto_list" "auto" "$CONFIG_FILE" || send_error "500 Internal Server Error" "Не удалось сбросить состояние профиля"
   else
-    orch_scoped_locked_clear "$requested_scope" "$PARAM_PROFILE" "${proto_list%% *}" || send_error "500 Internal Server Error" "Не удалось сбросить scoped lock"
+    ORCH_ACTIVE_SCOPE="$requested_scope" profile_state_set_and_apply "$PARAM_PROFILE" "$proto_list" "auto" "$CONFIG_FILE" || send_error "500 Internal Server Error" "Не удалось сбросить scoped lock"
   fi
   profile_config_voice_ports_changed "$PARAM_PROFILE" "$CONFIG_FILE" "$old_udp_ports" && service_zapret2 restart >/dev/null 2>&1 || true
   telemetry_notify
@@ -802,6 +832,7 @@ api_clear_lock() {
 }
 
 api_service() {
+  require_post_same_origin
   parse_params
   case "${PARAM_ACTION:-}" in
     start|stop|restart) ;;
@@ -859,8 +890,8 @@ api_update_check() {
   lzs="$(deploy_latest_field LATEST_ZATOR_SHA)"
   ws="$(deploy_version_field WEBUI_SHA)"
   lws="$(deploy_latest_field LATEST_WEBUI_SHA)"
-  if { [ -n "$zs" ] && [ -n "$lzs" ] && [ "$zs" != "$lzs" ]; } \
-     || { [ -e "$ZATOR_ROOT/webui/run-webui.sh" ] && [ -n "$ws" ] && [ -n "$lws" ] && [ "$ws" != "$lws" ]; }; then
+  if { [ -n "$lzs" ] && [ "$zs" != "$lzs" ]; } \
+     || { [ -e "$ZATOR_ROOT/webui/run-webui.sh" ] && [ -n "$lws" ] && [ "$ws" != "$lws" ]; }; then
     update=true
   fi
 
@@ -1564,9 +1595,10 @@ api_provider_get() {
 
 api_provider_set() {
   local name="${PARAM_NAME:-}" city="${PARAM_CITY:-}"
-  name="${name//$'\n'/}"
+  # Управляющие символы (вставленный TAB и т.п.) ломают JSON статуса.
+  name="${name//[[:cntrl:]]/}"
   name="${name//|/}"
-  city="${city//$'\n'/}"
+  city="${city//[[:cntrl:]]/}"
   city="${city//|/}"
   [ -n "$(printf '%s' "$name" | tr -d ' \t\r\n')" ] || send_error "400 Bad Request" "Укажите название провайдера"
   if ! type provider_set_manual >/dev/null 2>&1; then
@@ -1596,7 +1628,7 @@ _backup_date_from_name() {
 }
 
 api_backups_list() {
-  local list_file f items="" first=1 name size date_str d
+  local list_file f items="" name size date_str d
   if ! type backup_build_list_file >/dev/null 2>&1; then
     send_error "500 Internal Server Error" "Модуль бэкапов недоступен"
   fi
@@ -1615,8 +1647,9 @@ api_backups_list() {
         ;;
       *) date_str="" ;;
     esac
-    if [ "$first" = "1" ]; then first=0; else items="${items},"; fi
-    items="${items}{\"name\":\"${name}\",\"size\":${size:-0},\"date\":\"${date_str}\"}"
+    # Новые сверху (список CLI идёт по возрастанию): свёрнутая панель
+    # показывает первые 4, свежий/импортированный бэкап не должен прятаться.
+    items="{\"name\":\"${name}\",\"size\":${size:-0},\"date\":\"${date_str}\"}${items:+,$items}"
   done < <(wc -c $(cat "$list_file") 2>/dev/null)
   rm -f "$list_file"
   send_json "200 OK" "{\"items\":[${items}]}"
@@ -1779,7 +1812,8 @@ api_domains_list() {
     max_strat=0
   fi
 
-  while IFS= read -r line; do
+  # || [ -n ]: последняя строка без перевода строки (правка в Блокноте) тоже видна.
+  while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
     printf '%s' "$line" | grep -Eq '^[[:space:]]*#' && continue
     if [ "$first" = "1" ]; then first=0; else items="${items},"; fi
@@ -1811,6 +1845,7 @@ _domains_check_json() {
 
 # Действия над списком: add/remove/import/clear/set_strategy/clear_strategy/check.
 api_domains_action() {
+  require_post_same_origin
   parse_params
   local meta file kind
   meta="$(_domains_resolve_list "${PARAM_LIST:-}")" || send_error "400 Bad Request" "Неизвестный список"
@@ -1818,6 +1853,9 @@ api_domains_action() {
   meta="${meta#*|}"
   kind="${meta%%|*}"
   [ -n "$file" ] || send_error "500 Internal Server Error" "Не определён путь списка"
+  # Файл без перевода строки в конце (правка в Блокноте): иначе дописанная
+  # запись склеится с последней строкой.
+  [ -s "$file" ] && [ -n "$(tail -c 1 "$file" 2>/dev/null)" ] && printf '\n' >> "$file"
 
   local action="${PARAM_ACTION:-}"
   local domain normalized added=0 duplicates=0 skipped=0 count=0
@@ -1838,7 +1876,9 @@ api_domains_action() {
         normalized="$(z2r_normalize_domain "$domain")" || \
           send_error "400 Bad Request" "Некорректный домен: $domain"
       else
-        # Подстрока: только обрезка пробелов и непустота.
+        # Подстрока: только обрезка пробелов и непустота (управляющие символы
+        # вроде вставленного TAB ломают JSON списка — вырезаем).
+        domain="${domain//[[:cntrl:]]/}"
         normalized="${domain#"${domain%%[![:space:]]*}"}"
         normalized="${normalized%"${normalized##*[![:space:]]}"}"
         [ -n "$normalized" ] || send_error "400 Bad Request" "Пустая подстрока"
@@ -1871,6 +1911,7 @@ api_domains_action() {
       else
         # Подстрока: как при add — только обрезка пробелов, без нормализации.
         normalized="${PARAM_NEW_DOMAIN:-}"
+        normalized="${normalized//[[:cntrl:]]/}"
         normalized="${normalized#"${normalized%%[![:space:]]*}"}"
         normalized="${normalized%"${normalized##*[![:space:]]}"}"
         [ -n "$normalized" ] || send_error "400 Bad Request" "Пустая подстрока"
@@ -1906,18 +1947,21 @@ api_domains_action() {
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [ -n "$line" ] || { skipped=$((skipped+1)); continue; }
-        printf '%s' "$line" | grep -Eq '^[[:space:]]*#' && { skipped=$((skipped+1)); continue; }
+        case "$line" in '#'*) skipped=$((skipped+1)); continue ;; esac
         if [ "$kind" = "domain" ]; then
           normalized="$(z2r_normalize_domain "$line")" || { skipped=$((skipped+1)); continue; }
         else
-          normalized="$line"
+          normalized="${line//[[:cntrl:]]/}"
+          [ -n "$normalized" ] || { skipped=$((skipped+1)); continue; }
         fi
-        local add_result=""
-        domain_list_add "$file" "$normalized" "" "Домен" 1 add_result || { skipped=$((skipped+1)); continue; }
-        if [ "$add_result" = "duplicate" ]; then
+        # Без domain_list_add: его sed -i переписывает весь файл на каждую
+        # строку — большой импорт на роутере упирается в таймаут CGI.
+        # domain_list_prepare уже выполнен выше, один раз.
+        if grep -Fixq -- "$normalized" "$file" 2>/dev/null; then
           duplicates=$((duplicates+1))
           continue
         fi
+        printf '%s\n' "$normalized" >> "$file" || { skipped=$((skipped+1)); continue; }
         added=$((added+1))
       done
       set +f
@@ -1954,14 +1998,14 @@ api_domains_action() {
       fi
       [ "$strat" -ge 1 ] && [ "$strat" -le "$max_strat" ] || \
         send_error "400 Bad Request" "Стратегия вне диапазона (1..${max_strat})"
-      orch_locked_set "$domain" "tls" "$strat"
+      orch_locked_set "$domain" "tls" "$strat" || send_error "500 Internal Server Error" "Не удалось сохранить стратегию домена"
       send_json "200 OK" "{\"ok\":true,\"strategy\":${strat},\"check\":$(_domains_check_json "$domain")}"
       ;;
     clear_strategy)
       [ "$PARAM_LIST" = "custom_rkn" ] || send_error "400 Bad Request" "Стратегия применяется только к TCP_Custom"
       domain="${PARAM_DOMAIN:-}"
       [ -n "$domain" ] || send_error "400 Bad Request" "Не указан домен"
-      orch_locked_clear "$domain" "tls"
+      orch_locked_clear "$domain" "tls" || send_error "500 Internal Server Error" "Не удалось сбросить стратегию домена"
       send_json "200 OK" "{\"ok\":true}"
       ;;
     check)

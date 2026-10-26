@@ -28,6 +28,10 @@ local SLM_AUTO_LOCKED_PATH = "/tmp/auto_locked.tsv"
 local SLM_AUTO_LOCKED_BACKUP_PATH = "/opt/zator/extra_strats/cache/orchestra/auto_locked.tsv"
 local SLM_AUTO_LOCKED_BACKUP_INTERVAL = 1800
 local SLM_AUTO_LOCKED_LAST_BACKUP = 0
+-- Changes skipped by the backup interval; flushed by slm_flush_auto_locked_backup.
+local SLM_AUTO_LOCKED_BACKUP_DIRTY = false
+-- Растёт при каждом изменении SLM_AUTO_LOCKED: инвалидирует кеш порядка ротации.
+local SLM_AUTO_LOCKED_VERSION = 0
 
 -- ==================== SEPARATE SUBDOMAINS ====================
 -- Domains that should NOT be grouped by NLD (need separate strategies)
@@ -463,10 +467,12 @@ local function slm_get_quality_bucket(askey, scope)
 end
 
 -- Serializes the whole SLM_AUTO_LOCKED table to `path`. Returns true on
--- success, false if the file couldn't be opened for writing.
+-- success, false if the file couldn't be opened or written (ENOSPC: an empty
+-- or partial tmp must not replace the good file).
 local function slm_write_auto_locked_to(path)
     local f = io.open(path, "w")
     if not f then return false end
+    local ok = true
     for askey, scopes in pairs(SLM_AUTO_LOCKED) do
         if type(scopes) == "table" then
             for scope, hosts in pairs(scopes) do
@@ -474,9 +480,9 @@ local function slm_write_auto_locked_to(path)
                     for host, strat in pairs(hosts) do
                         if type(strat) == "number" then
                             if scope == "default" then
-                                f:write(askey, "\t", host, "\t", tostring(strat), "\n")
+                                ok = f:write(askey, "\t", host, "\t", tostring(strat), "\n") and ok
                             else
-                                f:write(askey, "\t", scope, "\t", host, "\t", tostring(strat), "\n")
+                                ok = f:write(askey, "\t", scope, "\t", host, "\t", tostring(strat), "\n") and ok
                             end
                         end
                     end
@@ -484,8 +490,8 @@ local function slm_write_auto_locked_to(path)
             end
         end
     end
-    f:close()
-    return true
+    local closed = f:close()
+    return (ok and closed) and true or false
 end
 
 -- Atomically replaces `path`, so readers never see a partially written TSV.
@@ -513,12 +519,31 @@ local function slm_save_auto_locked()
         now < SLM_AUTO_LOCKED_LAST_BACKUP or
         now - SLM_AUTO_LOCKED_LAST_BACKUP >= SLM_AUTO_LOCKED_BACKUP_INTERVAL
 
+    SLM_AUTO_LOCKED_BACKUP_DIRTY = true
     if not active_saved or backup_due then
         if slm_write_auto_locked_atomic(SLM_AUTO_LOCKED_BACKUP_PATH) then
             SLM_AUTO_LOCKED_LAST_BACKUP = now
+            SLM_AUTO_LOCKED_BACKUP_DIRTY = false
         elseif DLOG then
             DLOG("slm_quality: failed to back up auto locks to " .. SLM_AUTO_LOCKED_BACKUP_PATH)
         end
+    end
+end
+
+-- Deferred backup: the last changes inside an interval used to stay in /tmp
+-- only and were lost on reboot when nothing changed afterwards. Called on
+-- every lookup, so it must stay cheap until the interval has passed.
+local function slm_flush_auto_locked_backup()
+    if not SLM_AUTO_LOCKED_BACKUP_DIRTY then return end
+    local now = os.time()
+    if now >= SLM_AUTO_LOCKED_LAST_BACKUP and
+        now - SLM_AUTO_LOCKED_LAST_BACKUP < SLM_AUTO_LOCKED_BACKUP_INTERVAL then return end
+    -- a failed write is retried after the next interval, not on every packet
+    SLM_AUTO_LOCKED_LAST_BACKUP = now
+    if slm_write_auto_locked_atomic(SLM_AUTO_LOCKED_BACKUP_PATH) then
+        SLM_AUTO_LOCKED_BACKUP_DIRTY = false
+    elseif DLOG then
+        DLOG("slm_quality: failed to back up auto locks to " .. SLM_AUTO_LOCKED_BACKUP_PATH)
     end
 end
 
@@ -531,6 +556,7 @@ local function slm_set_auto_locked(askey, hostkey, strategy_id, scope)
     SLM_AUTO_LOCKED[askey][scope] = SLM_AUTO_LOCKED[askey][scope] or {}
     if SLM_AUTO_LOCKED[askey][scope][hostkey] == strategy_id then return end
     SLM_AUTO_LOCKED[askey][scope][hostkey] = strategy_id
+    SLM_AUTO_LOCKED_VERSION = SLM_AUTO_LOCKED_VERSION + 1
     slm_save_auto_locked()
 end
 
@@ -539,8 +565,98 @@ local function slm_clear_auto_locked(askey, hostkey, scope)
     local hosts = SLM_AUTO_LOCKED[askey] and SLM_AUTO_LOCKED[askey][slm_scope_key(scope)]
     if hosts and hosts[hostkey] then
         hosts[hostkey] = nil
+        SLM_AUTO_LOCKED_VERSION = SLM_AUTO_LOCKED_VERSION + 1
         slm_save_auto_locked()
     end
+end
+
+-- ==================== SEED / ROTATION ORDER ====================
+-- Порядок перебора для авторотации: сначала стратегии, на которых уже
+-- автозалочены соседние хосты того же askey/scope (по числу хостов, при
+-- равенстве — меньший номер), затем остальные по возрастанию. Кеш на
+-- askey/scope/ct, перестраивается только при смене SLM_AUTO_LOCKED_VERSION.
+local SLM_ROTATION_CACHE = {}
+
+--- @return table order массив номеров 1..ct, table counts strategy -> хостов
+function slm_rotation_order(askey, scope, ct)
+    askey = askey or "default"
+    scope = slm_scope_key(scope)
+    local ckey = askey .. "\t" .. scope
+    local cached = SLM_ROTATION_CACHE[ckey]
+    if cached and cached.version == SLM_AUTO_LOCKED_VERSION and cached.ct == ct then
+        return cached.order, cached.counts
+    end
+    local counts = {}
+    local hosts = SLM_AUTO_LOCKED[askey] and SLM_AUTO_LOCKED[askey][scope]
+    if type(hosts) == "table" then
+        for _, s in pairs(hosts) do
+            if type(s) == "number" and s >= 1 and s <= ct and s % 1 == 0 then
+                counts[s] = (counts[s] or 0) + 1
+            end
+        end
+    end
+    local order = {}
+    for s = 1, ct do order[s] = s end
+    table.sort(order, function(a, b)
+        local ca, cb = counts[a] or 0, counts[b] or 0
+        if ca ~= cb then return ca > cb end
+        return a < b
+    end)
+    SLM_ROTATION_CACHE[ckey] = { version = SLM_AUTO_LOCKED_VERSION, ct = ct, order = order, counts = counts }
+    return order, counts
+end
+
+--- Стартовая стратегия нового хоста: профильный лок из locked.tsv (только
+--- строка профиля) -> самая частая у >=2 автозалоченных соседей -> 1.
+function slm_seed_strategy(askey, scope, ct, proto, hostkey)
+    askey = askey or "default"
+    ct = tonumber(ct) or 0
+    if ct < 1 then return 1 end
+    if type(locked_strategy_for_profile) == "function" then
+        local s = tonumber((locked_strategy_for_profile(askey, proto or "tls", slm_scope_key(scope))))
+        if s and s >= 1 and s <= ct and not slm_is_blocked(askey, hostkey, s, scope) then
+            return s, "profile-lock"
+        end
+    end
+    local order, counts = slm_rotation_order(askey, scope, ct)
+    for _, s in ipairs(order) do
+        if (counts[s] or 0) < 2 then break end
+        if not slm_is_blocked(askey, hostkey, s, scope) then return s, "siblings" end
+    end
+    return 1, "default"
+end
+
+--- Следующая стратегия после провала cur: по кешированному порядку, без
+--- заблокированных и уже провалившихся у этого хоста в текущем цикле
+--- (hrec.slm_tried; когда перепробовано всё — цикл начинается заново).
+function slm_rotation_next(askey, scope, cur, ct, hrec, hostkey)
+    askey = askey or "default"
+    if not ct or ct < 1 then return cur end
+    local order = slm_rotation_order(askey, scope, ct)
+    local tried = hrec and hrec.slm_tried
+    if hrec then
+        if not tried then tried = {}; hrec.slm_tried = tried end
+        if cur then tried[cur] = true end
+    end
+    local start = 0
+    for i = 1, ct do
+        if order[i] == cur then start = i; break end
+    end
+    for pass = 1, 2 do
+        for step = 1, ct do
+            local s = order[((start + step - 1) % ct) + 1]
+            if s ~= cur and not (tried and tried[s]) and not slm_is_blocked(askey, hostkey, s, scope) then
+                return s
+            end
+        end
+        -- всё перепробовано: новый цикл, cur остаётся отмеченным
+        if not tried then break end
+        tried = {}
+        if cur then tried[cur] = true end
+        hrec.slm_tried = tried
+    end
+    -- остались только заблокированные: прежнее поведение — остаёмся на cur
+    return cur
 end
 
 --- Commits an automatic lock and persists it in auto_locked.tsv.
@@ -760,6 +876,7 @@ end
 --- @param hostkey string Имя хоста (будет нормализовано)
 --- @return number|nil strategy_id Залоченная стратегия или nil
 function slm_get_locked(askey, hostkey, scope)
+    slm_flush_auto_locked_backup()
     if not hostkey then return nil end
 
     -- Нормализуем askey
@@ -991,6 +1108,7 @@ local function slm_load_auto_locked()
         end
     end
     f:close()
+    SLM_AUTO_LOCKED_VERSION = SLM_AUTO_LOCKED_VERSION + 1
 
     if restored_from_backup and not slm_write_auto_locked_atomic(SLM_AUTO_LOCKED_PATH) and DLOG then
         DLOG("slm_quality: failed to restore active auto locks to " .. SLM_AUTO_LOCKED_PATH)

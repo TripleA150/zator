@@ -56,6 +56,7 @@ case "${REQUEST_METHOD:-GET}" in
     esac
     ;;
   POST)
+    require_post_same_origin
     parse_params
     case "${PARAM_SETTING:-}" in
       tls_blob)

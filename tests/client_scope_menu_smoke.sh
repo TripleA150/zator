@@ -158,6 +158,14 @@ orch_scoped_locked_set default example.net tls 0 || fail 'set domain lock 0'
 orch_scoped_locked_set default aa.example.org tls 5 || fail 'set second domain lock'
 table_out="$(client_scopes_print_table)"
 printf '%s\n' "$table_out" | grep -q 'домены (2): aa.example.org/tls=5, example.net/tls=выкл' || fail 'print_table should group+sort domains and render 0 as выкл'
+# Профиль 10 (DNS) — профиль, а не домен; сортировка числовая (10 после 2).
+orch_scoped_locked_set default 10 udp 3 || fail 'set profile 10 lock'
+orch_scoped_locked_set default 2 tls 1 || fail 'set profile 2 lock'
+table_out="$(client_scopes_print_table)"
+printf '%s\n' "$table_out" | grep -q 'YouTube/tls=3, Googlevideo/tls=1, DNS/udp=3' || fail 'print_table should render profile 10 as DNS after profile 2'
+printf '%s\n' "$table_out" | grep -q 'домены (2): ' || fail 'profile 10 must not be counted as a domain'
+orch_scoped_locked_clear default 10 udp || fail 'clear profile 10 lock'
+orch_scoped_locked_clear default 2 tls || fail 'clear profile 2 lock'
 _client_scopes_lock_line default | grep -q 'YouTube/tls=3' || fail 'lock_line should render profile names'
 _client_scopes_lock_line default | grep -q 'example.net/tls=выкл' || fail 'lock_line should render 0 as выкл'
 orch_scoped_locked_clear default example.net tls || fail 'clear domain lock'

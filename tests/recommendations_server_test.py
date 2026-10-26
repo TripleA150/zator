@@ -168,6 +168,32 @@ class RecommendationsTest(unittest.TestCase):
         self.assertEqual([r[4] for r in ranked], ["10", "10", "10"])
         self.assertEqual(MODULE.percent(1, 100000), "0.001")
 
+    def test_wilson_rank_beats_tiny_perfect_samples(self):
+        # 1: 47/50; 2: 3/3 (3 UUID); 3: 2/2 (2 UUID, ниже MIN_STRATEGY_UUIDS).
+        runs = [run(f"u{i}", verdicts=("ok",)) for i in range(47)]
+        runs.append(run("p1", verdicts=("fail", "ok")))
+        runs += [run(f"p{i}", verdicts=("fail", "ok", "ok")) for i in (2, 3)]
+        self.assertEqual(MODULE.MIN_STRATEGY_UUIDS, 3)
+        for p in ("1", "3"):
+            with self.subTest(profile=p):
+                ranked = [r for r in rows(runs) if r[:2] == ["strategy", p]]
+                self.assertEqual([(r[2], r[3], r[4]) for r in ranked], [("1", "94", "50"), ("2", "100", "3")])
+        self.assertLess(MODULE.wilson_lower(1, 1), MODULE.wilson_lower(47, 50))
+        self.assertLess(MODULE.wilson_lower(3, 3), MODULE.wilson_lower(47, 50))
+        self.assertEqual(MODULE.wilson_lower(0, 0), 0.0)
+
+    def test_rank_ties_are_deterministic(self):
+        runs = [run(str(i), verdicts=("ok",) * 5) for i in range(10)]
+        expected = [r for r in rows(runs) if r[0] == "strategy"]
+        self.assertEqual([r[2] for r in expected if r[1] == "1"], ["1", "2", "3"])
+        self.assertEqual([r for r in rows(runs[::-1]) if r[0] == "strategy"], expected)
+
+    def test_clone_hint_needs_sample_aware_advantage(self):
+        # Сырые 100% clone (3/3) > 75% classic (30/40), но по Wilson clone не лучше.
+        classic = [run(str(i), verdicts=("ok", "ok", "ok", "fail")) for i in range(10)]
+        clone = [run(str(i), 2, "clone", ("ok",)) for i in range(3)]
+        self.assertEqual([r[3] for r in rows(classic + clone)[1:5]], ["0"] * 4)
+
     def test_clone_comparison_weights_probes_not_run_percentages(self):
         # Classic average 66.7%, weighted 2/12; clone 50% must win.
         classic = [run(str(i), verdicts=("ok",)) for i in range(2)]

@@ -91,7 +91,7 @@ supersweep_report_tsv() {
         for(i=1;i<=na;i++){key=order[i];print "A",kind[key],clean(dest[key]),applied[key]}
     }' "$@" || return 1
     if [ -s "$dir/coverage.tsv" ]; then
-        _supersweep_rkn_domain_winners "$dir/coverage.tsv" | awk -F '\t' 'BEGIN{OFS="\t"} {gsub(/[[:cntrl:]]/," ",$1);print "D",$1,$3==2?"-":$2,$3==0?"ok":$3==1?"warn":"fail"}'
+        _supersweep_rkn_domain_winners "$dir/coverage.tsv" "$dir/progress.rkn.tsv" | awk -F '\t' 'BEGIN{OFS="\t"} {gsub(/[[:cntrl:]]/," ",$1);print "D",$1,$3==2?"-":$2,$3==0?"ok":$3==1?"warn":"fail"}'
     fi
 }
 
@@ -215,18 +215,30 @@ _supersweep_phase_pause() {
     return 0
 }
 
-# Победитель домена: ok > warn > fail, затем скорость и меньший номер; rank 0=ok, 1=warn.
+# Победитель домена: ok > warn > fail, затем обе TLS (необязательный $2 =
+# progress.rkn.tsv), скорость и меньший номер; rank 0=ok, 1=warn.
 _supersweep_rkn_domain_winners() {
-    awk -F'\t' '
+    awk -F'\t' -v pr="${2:-}" '
+        BEGIN {
+            if (pr != "") {
+                while ((getline line < pr) > 0) {
+                    split(line, a, "\t")
+                    if (a[5] == "ok" && a[6] == "ok") fullk[a[2] SUBSEP a[3]] = 1
+                }
+                close(pr)
+            }
+        }
         {
             key = $2
             rank = ($4 == "ok") ? 0 : ($4 == "warn") ? 1 : 2
+            f = ((key SUBSEP $3) in fullk) ? 1 : 0
             better = 0
             if (!(key in bs)) better = 1
             else if (rank < br[key]) better = 1
-            else if (rank == br[key] && $6 + 0 > bspeed[key] + 0) better = 1
-            else if (rank == br[key] && $6 + 0 == bspeed[key] + 0 && $3 + 0 < bs[key] + 0) better = 1
-            if (better) { bs[key] = $3; br[key] = rank; bspeed[key] = $6 }
+            else if (rank == br[key] && f > bf[key]) better = 1
+            else if (rank == br[key] && f == bf[key] && $6 + 0 > bspeed[key] + 0) better = 1
+            else if (rank == br[key] && f == bf[key] && $6 + 0 == bspeed[key] + 0 && $3 + 0 < bs[key] + 0) better = 1
+            if (better) { bs[key] = $3; br[key] = rank; bspeed[key] = $6; bf[key] = f }
         }
         END {
             for (d in bs) print d "\t" bs[d] "\t" br[d]
@@ -302,7 +314,7 @@ _supersweep_verdict_color() {
 # внешний firewall-фреймворк (ndm на Keenetic), транспорт
 # переустанавливается на месте — прогон продолжает работу.
 _supersweep_check_target() {
-    local out seq_before seq_after try attempt isolation_lost
+    local out seq_before seq_after try attempt isolation_lost l12 l13 st12 st13 rc code unused
     for attempt in 1 2; do
         if [ "${Z2R_SUPERSWEEP_ISOLATED:-0}" = 1 ]; then
             for try in 1 2 3; do
@@ -339,6 +351,17 @@ _supersweep_check_target() {
             done
             # Ответ при потере изоляции недостоверен; повторяем всю пробу один раз.
             [ "$isolation_lost" = 0 ] || continue
+            # DNS не разрешился в обеих версиях: пакеты не уходили, очередь и не
+            # могла сдвинуться — это красная проба мёртвого домена, не потеря изоляции.
+            { IFS= read -r l12; IFS= read -r l13; } <<< "$out"
+            IFS='|' read -r rc code unused <<< "$l12"
+            z2r_tls_version_state "$rc" "$code" st12
+            IFS='|' read -r rc code unused <<< "$l13"
+            z2r_tls_version_state "$rc" "$code" st13
+            if [ "$st12" = dns ] && [ "$st13" = dns ]; then
+                printf '%s\n' "$out"
+                return 0
+            fi
             seq_after="$(supersweep_probe_sequence)" || { : > "$Z2R_SUPERSWEEP_DIR/cancel"; return 1; }
             if [ "$seq_before" = "$seq_after" ]; then
                 echo 'Пакеты не попали в тестовую NFQUEUE: проверьте маршрутизацию и DNS. Прогон остановлен.' >&2
@@ -407,6 +430,123 @@ _supersweep_worker_priority() {
     renice 10 -p "$pid" >/dev/null 2>&1 || true
 }
 
+# Пауза после пробы профильного воркера; settle входит в паузу,
+# интервал проверок = пауза + время пробы. Обе TLS зелёные → GREEN_PAUSE
+# (0 отключает), в том числе для Discord. $7=confirm помечает строку pacing.tsv.
+_supersweep_pause_after() {
+    local name="$1" s="$2" token="$3" q12="$4" q13="$5" psleep="$6" mark="${7:-}" settle_v g
+    settle_v="${Z2R_SUPERSWEEP_SETTLE:-2}"
+    case "$settle_v" in ''|*[!0-9]*) settle_v=2 ;; esac
+    if [ "$psleep" -gt "$settle_v" ]; then
+        psleep=$((psleep - settle_v))
+    else
+        psleep=0
+    fi
+    if [ "$token" = ok ] && [ "$q12" = 1 ] && [ "$q13" = 1 ]; then
+        g="${Z2R_SUPERSWEEP_GREEN_PAUSE:-5}"
+        case "$g" in ''|*[!0-9]*) g=5 ;; esac
+        # Ускоритель только сокращает: при паузе 5 красный интервал уже 3 с.
+        if [ "$g" -gt 0 ] && [ "$g" -lt "$psleep" ]; then psleep="$g"; fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "$s" "$psleep" "$mark" >> "${Z2R_SUPERSWEEP_DIR}/pacing.tsv"
+    [ "$psleep" -gt 0 ] && _supersweep_sleep "$psleep"
+    return 0
+}
+
+# Повторные проверки: K лучших зелёных ещё R раз (0 в любом — выключено).
+# Вывод: "K R".
+_supersweep_confirm_params() {
+    local k="${Z2R_SUPERSWEEP_CONFIRM_TOP:-3}" r="${Z2R_SUPERSWEEP_CONFIRM_ROUNDS:-2}"
+    case "$k" in ''|*[!0-9]*) k=3 ;; *) [ "${#k}" -le 3 ] || k=10; k=$((10#$k)) ;; esac
+    case "$r" in ''|*[!0-9]*) r=2 ;; *) [ "${#r}" -le 3 ] || r=5; r=$((10#$r)) ;; esac
+    [ "$k" -le 10 ] || k=10
+    [ "$r" -le 5 ] || r=5
+    [ "$r" -gt 0 ] || k=0
+    [ "$k" -gt 0 ] || r=0
+    echo "$k $r"
+}
+
+# Кандидаты из зелёных основного прохода: обе TLS → скорость → меньший номер.
+_supersweep_confirm_cands() {
+    awk -F'\t' '$4 == "ok" && $3 ~ /^[0-9]+$/ {
+            sp = ($7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.?[0-9]*$/ && $8 + 0 > 0) ? $7 / $8 : 0
+            printf "%d %.0f %d\n", ($5 == "ok" && $6 == "ok"), sp, $3
+        }' "$1" 2>/dev/null \
+        | sort -k1,1nr -k2,2nr -k3,3n | head -n "$2" \
+        | awk '{printf "%s%s", sep, $3; sep = " "} END{if (NR) printf "\n"}'
+}
+
+# Перепроверка кандидатов вперемешку (A,B,C,A,B,C): короткий провал канала
+# не бьёт по одному кандидату. Те же лок/settle/пауза; строки — в confirm.<name>.tsv,
+# progress.<name>.tsv не меняется (контракт сервера статистики).
+# Продолжает round и ss_interrupted вызывающего воркера.
+_supersweep_confirm() {
+    local name="$1" tag="$2" profile="$3" proto_list="$4" url="$5" tls_pref="$6" pause_sec="$7" rounds="$8"
+    shift 8
+    local cands="$*" dir="$Z2R_SUPERSWEEP_DIR" r s p specs out v12 v13 dl short token q12 q13 rc code unused epoch
+    local left=$(( rounds * $# ))
+    : >> "${dir}/confirm.${name}.tsv"
+    echo -e "$(date '+%H:%M:%S') ${cyan}[${tag}] Повторная проверка лучших зелёных (${cands}): ещё ${rounds} раз(а) каждую.${plain}"
+    for ((r=1; r<=rounds; r++)); do
+        for s in $cands; do
+            if [ "$ss_interrupted" = 1 ] || _supersweep_cancelled; then return 1; fi
+            round=$((round + 1)); left=$((left - 1))
+            specs=""
+            for p in $proto_list; do
+                specs="${specs}profile|${profile}|${p}|${s}
+"
+            done
+            _supersweep_request_lock "$name" "$round" "$specs" || return 1
+            _supersweep_settle
+            out="$(_supersweep_check_target "$url")" || return 1
+            { IFS= read -r v12; IFS= read -r v13; IFS= read -r dl; } <<< "$out"
+            short="$(z2r_tls_short_result "$v12" "$v13" "$dl" "$tls_pref")"
+            token="${short%%|*}"; short="${short#*|}"
+            case "$token" in ok|warn) ;; *) token=fail ;; esac
+            q12=0; q13=0
+            IFS='|' read -r rc code unused <<< "$v12"
+            z2r_tls_code_ok "$code" && q12=1
+            IFS='|' read -r rc code unused <<< "$v13"
+            z2r_tls_code_ok "$code" && q13=1
+            _supersweep_print_line "${tag}+" "" "$s" "$token" "$v12" "$v13" "$short"
+            printf -v epoch '%(%s)T' -1 2>/dev/null || epoch="$(date +%s)"
+            _supersweep_progress_row "$epoch" "$profile" "$s" "$token" "$v12" "$v13" "$dl" "$short" \
+                >> "${dir}/confirm.${name}.tsv"
+            [ "$left" -gt 0 ] && _supersweep_pause_after "$name" "$s" "$token" "$q12" "$q13" "$pause_sec" confirm
+        done
+    done
+    return 0
+}
+
+# Победитель перепроверки: больше зелёных проб → обе TLS на каждой зелёной →
+# минимальная скорость (консервативно) → меньший номер.
+# Вывод: strategy|passes|probes|s:p/t,... (порядок кандидатов).
+_supersweep_confirm_score() {
+    awk -F'\t' -v cands="$3" '
+        BEGIN { n = split(cands, cl, " "); for (i = 1; i <= n; i++) want[cl[i]] = 1 }
+        !($3 in want) { next }
+        { cnt[$3]++ }
+        $4 == "ok" {
+            pass[$3]++
+            if (!($5 == "ok" && $6 == "ok")) part[$3] = 1
+            if ($7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.?[0-9]*$/ && $8 + 0 > 0) {
+                sp = $7 / $8
+                if (!($3 in mn) || sp < mn[$3]) mn[$3] = sp
+            }
+        }
+        END {
+            b = ""; info = ""
+            for (i = 1; i <= n; i++) {
+                s = cl[i]; f = !(s in part); v = mn[s] + 0; ps = pass[s] + 0
+                info = info (i > 1 ? "," : "") s ":" ps "/" cnt[s] + 0
+                if (b == "" || ps > bp || (ps == bp && (f > bf || (f == bf && (v > bv || (v == bv && s + 0 < b + 0)))))) {
+                    b = s; bp = ps; bf = f; bv = v
+                }
+            }
+            if (b != "") print b "|" bp "|" cnt[b] + 0 "|" info
+        }' "$1" "$2" 2>/dev/null
+}
+
 _supersweep_worker_profile() {
     _supersweep_worker_priority
     local name="$1" tag="$2" profile="$3" proto_list="$4" url="$5" max="$6"
@@ -415,10 +555,8 @@ _supersweep_worker_profile() {
     local s p round=0 out v12 v13 dl short token specs epoch
     local ok_list="" warn_list="" full_list="" ok_stats="" warn_stats=""
     local n_ok=0 n_warn=0 n_fail=0
-    local ss_interrupted=0 psleep settle_v g
-    # Settle входит в паузу; интервал проверок = пауза + время пробы.
-    settle_v="${Z2R_SUPERSWEEP_SETTLE:-2}"
-    case "$settle_v" in ''|*[!0-9]*) settle_v=2 ;; esac
+    local ss_interrupted=0 c_top c_rounds
+    read -r c_top c_rounds <<< "$(_supersweep_confirm_params)"
     trap 'ss_interrupted=1' INT TERM
     set +e
 
@@ -471,20 +609,10 @@ _supersweep_worker_profile() {
             >> "${dir}/progress.${name}.tsv"
 
         if [ "$s" -lt "$max" ]; then
-            # Обе TLS зелёные → GREEN_PAUSE (0 отключает), в том числе для Discord.
-            psleep="$pause_sec"
-            if [ "$psleep" -gt "$settle_v" ]; then
-                psleep=$((psleep - settle_v))
-            else
-                psleep=0
-            fi
-            if [ "$token" = ok ] && [ "$q12" = 1 ] && [ "$q13" = 1 ]; then
-                g="${Z2R_SUPERSWEEP_GREEN_PAUSE:-5}"
-                case "$g" in ''|*[!0-9]*) g=5 ;; esac
-                if [ "$g" -gt 0 ]; then psleep="$g"; fi
-            fi
-            printf '%s\t%s\t%s\t%s\n' "$name" "$s" "$psleep" >> "${dir}/pacing.tsv"
-            [ "$psleep" -gt 0 ] && _supersweep_sleep "$psleep"
+            _supersweep_pause_after "$name" "$s" "$token" "$q12" "$q13" "$pause_sec"
+        elif [ "$c_top" -gt 0 ] && [ -n "$ok_list" ]; then
+            # Перед повторными проверками — обычная пауза.
+            _supersweep_pause_after "$name" "$s" "$token" "$q12" "$q13" "$pause_sec" confirm
         fi
     done
     # До записи best.<name> сохраняем traps против повторного INT.
@@ -493,9 +621,32 @@ _supersweep_worker_profile() {
     local ss_incomplete=0
     [ "$s" -le "$max" ] && ss_incomplete=1
 
-    # Самая быстрая зелёная; без докачки — первая; без зелёных — жёлтая.
-    local best="" best_short="" best_kind="" win
-    if [ -n "$ok_stats" ]; then
+    local best="" best_short="" best_kind="" win stable="" confirm_info="" cands
+    # Полный проход: лучшие зелёные перепроверяются, победитель — по числу проходов.
+    if [ "$ss_incomplete" = 0 ] && [ "$ss_interrupted" != 1 ] && [ "$c_top" -gt 0 ] && [ -n "$ok_list" ] \
+        && ! _supersweep_cancelled; then
+        cands="$(_supersweep_confirm_cands "${dir}/progress.${name}.tsv" "$c_top")"
+        if [ -n "$cands" ]; then
+            _supersweep_confirm "$name" "$tag" "$profile" "$proto_list" "$url" "$tls_pref" "$pause_sec" "$c_rounds" $cands
+            win="$(_supersweep_confirm_score "${dir}/progress.${name}.tsv" "${dir}/confirm.${name}.tsv" "$cands")"
+            confirm_info="${win##*|}"; win="${win%|*}"
+            best="${win%%|*}"; win="${win#*|}"
+        fi
+    fi
+    if [ -n "$best" ]; then
+        best_kind="best"
+        best_short="$(printf '%s' "$ok_stats" | awk -F'|' -v s="$best" '$1 == s {sub(/^[^|]*[|][^|]*[|][^|]*[|]/, ""); print; exit}')"
+        [ -n "$best_short" ] || best_short="сервер ответил (без докачки)"
+        # win = проходы|проб; стабильна при 2+ зелёных пробах.
+        if [ "${win%%|*}" -ge 2 ]; then
+            stable=1; best_short="подтверждена ${win%%|*}/${win#*|}; ${best_short}"
+        else
+            stable=0; best_short="не подтверждена ${win%%|*}/${win#*|}; ${best_short}"
+            echo -e "$(date '+%H:%M:%S') ${yellow}[${tag}] Стратегия ${best} нестабильна (${win%%|*}/${win#*|}): применяется как лучшая из найденных, при сбоях повторите прогон позже.${plain}"
+        fi
+    fi
+    # Без перепроверки: самая быстрая зелёная; без докачки — первая; без зелёных — жёлтая.
+    if [ -z "$best" ] && [ -n "$ok_stats" ]; then
         win="$(printf '%s' "$ok_stats" | awk -F'|' 'BEGIN{max=-1} {t=$2+0; sz=$3+0; if (t>0 && sz/t>max) {max=sz/t; line=$0}} END{print line}')"
         best="${win%%|*}"; best_kind="best"
         best_short="$(printf '%s' "$win" | cut -d'|' -f4-)"
@@ -523,24 +674,44 @@ _supersweep_worker_profile() {
         printf 'n_warn=%s\n' "$n_warn"
         printf 'n_fail=%s\n' "$n_fail"
         printf 'interrupted=%s\n' "$ss_incomplete"
+        # Только после перепроверки: при CONFIRM_TOP=0 файл прежний.
+        [ -z "$stable" ] || printf 'stable=%s\nconfirm=%s\n' "$stable" "$confirm_info"
     } > "${dir}/best.${name}"
     : > "${dir}/done.${name}"
 }
 
 # TSV: ok_winner, ok_cover, total, warn_winner, warn_cover.
-# Рейтинг: покрытие → сумма скоростей → меньший номер. Warn только для отчёта.
+# Рейтинг: покрытие → покрытие обеими TLS (progress.rkn.tsv) → зелёные на
+# YouTube/Googlevideo (общий шаблон нумерации) → сумма скоростей → меньший номер.
+# Файлы $3..$5 необязательны: без них — прежний порядок. Warn только для отчёта.
 _supersweep_rkn_winners() {
     local total="$1" file="$2"
-    awk -F'\t' -v total="$total" '
+    awk -F'\t' -v total="$total" -v pr="${3:-}" -v yt="${4:-}" -v gv="${5:-}" '
+        function slurp(f, full,   line, a) {
+            if (f == "") return
+            while ((getline line < f) > 0) {
+                split(line, a, "\t")
+                if (a[4] != "ok") continue
+                if (full) { if (a[5] == "ok" && a[6] == "ok") fl[a[3]]++ }
+                else x[a[3]]++
+            }
+            close(f)
+        }
+        function better(s, b) {
+            if (b == "") return 1
+            if (c[s] != c[b]) return (c[s] > c[b])
+            if (fl[s] + 0 != fl[b] + 0) return (fl[s] + 0 > fl[b] + 0)
+            if (x[s] + 0 != x[b] + 0) return (x[s] + 0 > x[b] + 0)
+            if (sp[s] != sp[b]) return (sp[s] > sp[b])
+            return (s + 0 < b + 0)
+        }
+        BEGIN { slurp(pr, 1); slurp(yt, 0); slurp(gv, 0) }
         $4 == "ok"   { c[$3]++; sp[$3] += $6 }
         $4 == "warn" { w[$3]++; wsp[$3] += $6 }
         END {
-            bs = ""; bc = 0; bsp = 0
-            for (s in c) {
-                if (c[s] > bc || (c[s] == bc && sp[s] > bsp) || (c[s] == bc && sp[s] == bsp && (bs == "" || s+0 < bs+0))) {
-                    bs = s; bc = c[s]; bsp = sp[s]
-                }
-            }
+            bs = ""; bc = 0
+            for (s in c) if (better(s, bs)) bs = s
+            if (bs != "") bc = c[bs]
             ws = ""; wc = 0; wspd = 0
             for (s in w) {
                 if (w[s] > wc || (w[s] == wc && wsp[s] > wspd) || (w[s] == wc && wsp[s] == wspd && (ws == "" || s+0 < ws+0))) {
@@ -611,12 +782,15 @@ _supersweep_worker_rkn() {
     [ -n "$s_list" ] || s_list="$(for ((s=1; s<=max; s++)); do printf '%s ' "$s"; done)"
 
     # Полный последовательный проход каждого домена против rate-эвристик ТСПУ.
-    local dtot="$(_supersweep_count_list "$domains")" dnum=0 dom_first=1 peff g
+    # Одна пауза на промежуток между пробами, и на смене домена тоже;
+    # settle входит в паузу, как у профильных воркеров.
+    local dtot="$(_supersweep_count_list "$domains")" dnum=0 peff g settle_v s_last
+    settle_v="${Z2R_SUPERSWEEP_SETTLE:-2}"
+    case "$settle_v" in ''|*[!0-9]*) settle_v=2 ;; esac
+    for s_last in $s_list; do :; done
     for d in $domains; do
         [ "$ss_interrupted" = 1 ] && break
         _supersweep_cancelled && break
-        [ "$dom_first" = 1 ] || _supersweep_sleep "$pause_sec"
-        dom_first=0
         dnum=$((dnum + 1))
         echo -e "$(date '+%H:%M:%S') ${cyan}РКН: домен ${d} (${dnum}/${dtot}) — полный проход стратегий${plain}" >&2
         for s in $s_list; do
@@ -625,7 +799,7 @@ _supersweep_worker_rkn() {
             round=$((round + 1))
             _supersweep_request_lock "$name" "$round" "domain|${d}|tls|${s}" || { ss_interrupted=1; break; }
             _supersweep_settle
-            _supersweep_check_target "https://${d}/" > "${tmpd}/r.0" 2>/dev/null </dev/null \
+            _supersweep_check_target "https://${d}/" > "${tmpd}/r.0" </dev/null \
                 || { ss_interrupted=1; break; }
             [ "$ss_interrupted" = 1 ] && break
             out="$(< "${tmpd}/r.0")"
@@ -636,14 +810,21 @@ skip"
             { IFS= read -r v12; IFS= read -r v13; } <<< "$out"
             IFS='|' read -r rc code12 unused <<< "$v12"
             IFS='|' read -r rc code13 unused <<< "$v13"
+            # После последней пробы прогона ждать нечего: дальше только применение.
+            [ "$dnum" = "$dtot" ] && [ "$s" = "$s_last" ] && continue
             # Обе TLS зелёные → GREEN_PAUSE (0 отключает), иначе пауза пользователя без эскалации.
             peff="$pause_sec"
+            if [ "$peff" -gt "$settle_v" ]; then
+                peff=$((peff - settle_v))
+            else
+                peff=0
+            fi
             if [ "$token" = ok ] \
                 && z2r_tls_code_ok "$code12" \
                 && z2r_tls_code_ok "$code13"; then
                 g="${Z2R_SUPERSWEEP_GREEN_PAUSE:-5}"
                 case "$g" in ''|*[!0-9]*) g=5 ;; esac
-                if [ "$g" -gt 0 ]; then peff="$g"; fi
+                if [ "$g" -gt 0 ] && [ "$g" -lt "$peff" ]; then peff="$g"; fi
             fi
             printf '%s\t%s\t%s\t%s\n' "rkn" "$s" "$peff" >> "${dir}/pacing.tsv"
             [ "$peff" -gt 0 ] && _supersweep_sleep "$peff"
@@ -652,15 +833,18 @@ skip"
     # До best.<name> сохраняем traps против повторного INT; неполную карту не применять.
     # После for s остаётся последним номером; завершение проверяем по coverage.tsv.
 
+    # Полнота — по парам домен×стратегия: иначе обрыв на 2-м домене выглядит полной картой.
     local ss_incomplete=0 probed=0 need=0
     for d in $s_list; do need=$((need + 1)); done
-    probed="$(cut -f3 "${dir}/coverage.tsv" 2>/dev/null | sort -u | wc -l | tr -d '[:space:]')"
+    need=$((need * dtot))
+    probed="$(cut -f2,3 "${dir}/coverage.tsv" 2>/dev/null | sort -u | wc -l | tr -d '[:space:]')"
     [ -n "$probed" ] || probed=0
     [ "$probed" -lt "$need" ] && ss_incomplete=1
+    [ "$ss_interrupted" = 1 ] && ss_incomplete=1
 
     # Warn только для отчёта: сплошной жёлтый может означать деградацию канала.
     local winner_line
-    winner_line="$(_supersweep_rkn_winners "$dtot" "${dir}/coverage.tsv")"
+    winner_line="$(_supersweep_rkn_winners "$dtot" "${dir}/coverage.tsv" "${dir}/progress.rkn.tsv" "${dir}/progress.yt.tsv" "${dir}/progress.gv.tsv")"
     {
         printf 'winner=%s\n' "$(printf '%s' "$winner_line" | cut -f1)"
         printf 'winner_cover=%s\n' "$(printf '%s' "$winner_line" | cut -f2)"
@@ -699,7 +883,7 @@ _supersweep_settle_worker() {
     if [ "$name" = rkn ]; then
         # Зелёные доменные победители — сразу; жёлтые — только по согласию в сводке.
         local dwin dstr drank
-        _supersweep_rkn_domain_winners "${dir}/coverage.tsv" \
+        _supersweep_rkn_domain_winners "${dir}/coverage.tsv" "${dir}/progress.rkn.tsv" \
             | while IFS="$(printf '\t')" read -r dwin dstr drank; do
                 [ -n "$dwin" ] || continue
                 [ "$drank" = 0 ] || continue
@@ -870,7 +1054,11 @@ _supersweep_meta_write() {
     uuid="$(_supersweep_stats_uuid)"
     prov=""
     if [ -s "${PROVIDER_TXT:-/opt/zator/extra_strats/cache/provider.txt}" ]; then
-        prov="$(head -n1 "${PROVIDER_TXT:-/opt/zator/extra_strats/cache/provider.txt}" | head -c 60)"
+        prov="$(head -n1 "${PROVIDER_TXT:-/opt/zator/extra_strats/cache/provider.txt}" | tr -d '\r')"
+        # Сервер принимает до 120 символов и группирует по бренду до « - »,
+        # как запрос подсказок: длинную строку шлём без города, а не срезом
+        # посередине бренда (иначе прогоны уходят в чужую корзину).
+        [ "${#prov}" -le 120 ] || prov="${prov%% - *}"
     fi
     blob_cfg="${ZAPRET2_ROOT:-/opt/zapret2}/config"
     [ -f "$blob_cfg" ] || blob_cfg="${ZAPRET2_ROOT:-/opt/zapret2}/config.default"
@@ -981,9 +1169,14 @@ supersweep_sanitize_domains() {
 _supersweep_estimate_total() {
     # $1..4: max профилей 1/2/4/3; $5: домены; $6..8: паузы yt/gv, ds, rkn. Выход: секунды.
     local m1="$1" m2="$2" m4="$3" m3="$4" nd="$5" p="$6" pd="$7" pr="$8"
-    local phase_pause="${Z2R_SUPERSWEEP_PHASE_PAUSE:-30}"
+    local phase_pause="${Z2R_SUPERSWEEP_PHASE_PAUSE:-30}" ck cr c1 c2 c4
     case "$phase_pause" in ''|*[!0-9]*) phase_pause=30 ;; esac
-    echo $(( m1 * (6 + p) + m2 * (6 + p) + m4 * (6 + pd) + nd * m3 * (6 + pr) + 3 * phase_pause ))
+    # Повторные проверки лучших зелёных: до K стратегий × R раз на профиль.
+    read -r ck cr <<< "$(_supersweep_confirm_params)"
+    c1=$ck; [ "$c1" -le "$m1" ] || c1=$m1
+    c2=$ck; [ "$c2" -le "$m2" ] || c2=$m2
+    c4=$ck; [ "$c4" -le "$m4" ] || c4=$m4
+    echo $(( (m1 + c1 * cr) * (6 + p) + (m2 + c2 * cr) * (6 + p) + (m4 + c4 * cr) * (6 + pd) + nd * m3 * (6 + pr) + 3 * phase_pause ))
 }
 
 # supersweep_run <tls_pref> <pause> <ds_pause> <rkn_pause> <rkn_par> <domain...>
@@ -1062,7 +1255,8 @@ _supersweep_run() {
     }
 
     rm -rf "$dir"
-    (umask 077; mkdir -p "$dir") || { echo -e "${red}Не удалось создать $dir${plain}"; return 1; }
+    # Без -p: каталог, пересозданный чужим процессом в /tmp после rm, не принимаем.
+    (umask 077; mkdir "$dir") || { echo -e "${red}Не удалось создать $dir${plain}"; return 1; }
     if [ "${Z2R_SUPERSWEEP_ISOLATED:-0}" = 1 ]; then
         mkdir -p "${dir}/probe" || return 1
     fi
@@ -1100,6 +1294,9 @@ _supersweep_run() {
     echo -e "${cyan}Суперавтопрогон по фазам: YouTube, затем Googlevideo, затем Discord, затем РКН по ${total_rkn} доменам (по одному, полный проход стратегий на каждый).${plain}"
     echo -e "Стратегий: профиль 1 — ${max1}, профиль 2 — ${max2}, профиль 4 — ${max4}, РКН — ${max3}. Пауза между проверками: ${pause_sec} сек (Discord ${ds_pause}, РКН ${rkn_pause} сек); время самой проверки добавляется сверху."
     echo -e "РКН: домены по одному, полный проход стратегий на каждый."
+    local ss_ck ss_cr
+    read -r ss_ck ss_cr <<< "$(_supersweep_confirm_params)"
+    [ "$ss_ck" = 0 ] || echo -e "Профили 1/2/4: до ${ss_ck} лучших зелёных перепроверяются ещё ${ss_cr} раз(а) перед применением."
     echo -e "Ориентировочно до $(( (est_total + 59) / 60 )) мин. Прогресс: ${dir}. Ctrl+C - прервать (прежние стратегии будут возвращены)."
     echo ""
 
@@ -1122,7 +1319,9 @@ _supersweep_run() {
     fi
 
     local interrupted=0
-    trap 'interrupted=1' INT
+    # HUP (закрытый SSH/PuTTY) — как Ctrl+C: пробные локи в рабочем locked.tsv
+    # обязаны откатиться. В фоне HUP игнорируется с входа, trap его не ловит.
+    trap 'interrupted=1' INT HUP
 
     # Один воркер за раз, паузы между фазами против rate-эвристик ТСПУ.
     local phase cancelled=0 pid poll last_alive="" last_st=""
@@ -1194,6 +1393,8 @@ _supersweep_run() {
         done
         wait "$pid" 2>/dev/null || true
         Z2R_SUPERSWEEP_WORKER_PID=""
+        # Воркер без HUP-trap умирает раньше, чем цикл ожидания увидит флаг.
+        [ "$interrupted" = 1 ] && cancelled=1
         _supersweep_cancelled && cancelled=1
         if [ "${Z2R_SUPERSWEEP_ISOLATED:-0}" = 1 ]; then
             supersweep_probe_stop || { cancelled=1; break; }
@@ -1210,7 +1411,7 @@ _supersweep_run() {
     done
     # До конца отката/сводки/архива глушим повторный INT, чтобы не оставить полулоки.
     # supersweep_menu вернёт обычный INT после финальной паузы.
-    trap ':' INT
+    trap ':' INT HUP
 
     Z2R_TLS_WAIT_BOTH="$wait_both_prev"
     export Z2R_TLS_WAIT_BOTH
@@ -1236,7 +1437,7 @@ _supersweep_run() {
     local warn_winner="" rkn_fallback_line=""
     if [ -z "$winner" ] && [ -s "${dir}/coverage.tsv" ] \
         && [ -z "$(_supersweep_kv_read "${dir}/best.rkn" reference)" ]; then
-        rkn_fallback_line="$(_supersweep_rkn_winners "$(_supersweep_count_list "$domains")" "${dir}/coverage.tsv")"
+        rkn_fallback_line="$(_supersweep_rkn_winners "$(_supersweep_count_list "$domains")" "${dir}/coverage.tsv" "${dir}/progress.rkn.tsv" "${dir}/progress.yt.tsv" "${dir}/progress.gv.tsv")"
         winner="$(printf '%s' "$rkn_fallback_line" | cut -f1)"
     fi
 
@@ -1351,6 +1552,10 @@ _supersweep_run() {
                 error)
                     echo -e "   ${red}Не удалось применить стратегию ${best} для профиля ${pkey}.${plain}"
                     ;;
+                none)
+                    # Воркер оборвался (interrupted=1): частичный результат не применяем.
+                    echo -e "   ${yellow}Кандидат ${best} не применён: проход профиля неполный.${plain}"
+                    ;;
                 *)
                     # Воркер умер до применения — применить здесь.
                     old_udp_ports="$(config_get_var "$cfg" NFQWS2_PORTS_UDP)"
@@ -1411,7 +1616,7 @@ _supersweep_run() {
         echo -e "   Прогон прерван — пер-доменные результаты не применялись."
     fi
     local warn_dom
-    warn_dom="$(_supersweep_rkn_domain_winners "${dir}/coverage.tsv" | awk -F'\t' '$3 == 1 { print $1 }' || true)"
+    warn_dom="$(_supersweep_rkn_domain_winners "${dir}/coverage.tsv" "${dir}/progress.rkn.tsv" | awk -F'\t' '$3 == 1 { print $1 }' || true)"
     if [ -n "$warn_dom" ]; then
         echo -e "   Жёлтые (только одна версия TLS, не применялись): ${yellow}$(printf '%s ' $warn_dom)${plain}"
         echo -e "   ${yellow}Сплошные жёлтые/красные результаты похожи на деградацию канала (возможно, сработала защита от частых переключений). Повторите прогон позже или с большей паузой.${plain}"
@@ -1419,7 +1624,7 @@ _supersweep_run() {
         if [ "$cancelled" != 1 ] && [ -t 0 ]; then
             read -re -p "   Применить жёлтые пер-доменные стратегии (одна версия TLS)? 1 - да, Enter - нет: " rkn_ans || rkn_ans=""
             if [ "$rkn_ans" = "1" ]; then
-                _supersweep_rkn_domain_winners "${dir}/coverage.tsv" \
+                _supersweep_rkn_domain_winners "${dir}/coverage.tsv" "${dir}/progress.rkn.tsv" \
                     | awk -F'\t' '$3 == 1 { print $1 "\t" $2 }' \
                     | while IFS="$(printf '\t')" read -r dwin dstr; do
                         [ -n "$dwin" ] || continue
@@ -1440,6 +1645,9 @@ _supersweep_run() {
     d_tab2="$(printf '\t')"
     if [ "$cancelled" = 1 ]; then
         echo -e "   Профильная стратегия РКН (весь список) не применялась — прогон прерван."
+    elif [ "$(_supersweep_kv_read "${dir}/best.rkn" interrupted)" = 1 ]; then
+        # Без best.rkn (воркер погиб) флага нет — работает резерв из coverage.tsv.
+        echo -e "   ${yellow}Профильная стратегия РКН не применялась: карта покрытий неполная.${plain}"
     elif [ -n "$winner" ]; then
         rkn_prof="$(awk -F'\t' '$1 == "profile" && $2 == 3 { print $3; exit }' "${dir}/applied.tsv" 2>/dev/null || true)"
         if [ -z "$rkn_prof" ]; then
@@ -1693,7 +1901,14 @@ supersweep_menu() {
         answer=""
         read -re -p "Enter - обычный старт, B/В - в фоне без переключения рабочих стратегий, 0 - отмена: " answer || answer="0"
         case "$answer" in
-            '') break ;;
+            '')
+                # Метка клиента ставится только его LAN-трафику: пробы с роутера идут
+                # в default scope, а локи писались бы клиенту — шум вместо подбора.
+                if [ "${ORCH_ACTIVE_SCOPE:-default}" != default ]; then
+                    echo -e "${yellow}Для клиента $(client_scopes_scope_label "$ORCH_ACTIVE_SCOPE" 2>/dev/null || printf '%s' "$ORCH_ACTIVE_SCOPE") доступен только фоновый режим (B): проверки с роутера идут в default scope.${plain}"
+                    continue
+                fi
+                break ;;
             b|B|в|В|б|Б) answer="B"; break ;;
             0) echo "Отмена."; return 0 ;;
             *) echo "Не удалось распознать ввод. Нажмите Enter, B/В или 0." ;;

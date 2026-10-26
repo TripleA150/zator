@@ -229,9 +229,44 @@ local function load_clone_size_file(path)
   f:close()
 end
 
-local function load_locked_tables()
+-- Детект смены lock-файлов внутри TTL: писатели (sweep, supersweep, WebUI)
+-- заменяют файл через mv, поэтому меняются inode/mtime/size. stat() есть не
+-- во всех сборках nfqws2 — без него остаётся прежний TTL (как у substring-листов).
+local LOCK_FILE_SIGS = {}
+
+local function lock_file_changed(slot, path)
+  local st = stat(path)
+  local old = LOCK_FILE_SIGS[slot]
+  if not st then
+    LOCK_FILE_SIGS[slot] = false
+    return old ~= false
+  end
+  if old and old.mtime == st.mtime and old.size == st.size and old.inode == st.inode then
+    return false
+  end
+  LOCK_FILE_SIGS[slot] = st
+  return true
+end
+
+-- Ровно два stat(): основной и ручной lock-файлы. Override/scoped-файлы
+-- пишутся меню, а не автопрогонами, — им хватает TTL.
+local function lock_files_changed()
+  if LOCKED_TEST_LINES or type(stat) ~= "function" then return false end
+  local main = lock_file_changed(1, LOCKED_PATH)
+  local manual = lock_file_changed(2, LOCKED_MANUAL_PATH)
+  return main or manual
+end
+
+-- check_files: сверять stat внутри TTL (circular_locked — раз на соединение).
+local function load_locked_tables(check_files)
   local now = os.time()
-  if now and (now - last_load) < cache_ttl then return end
+  -- now < last_load: часы шагнули назад (NTP после загрузки) — перечитываем
+  if now and now >= last_load and (now - last_load) < cache_ttl then
+    if not check_files or not lock_files_changed() then return end
+  else
+    -- запоминаем подписи до чтения: замена между stat и чтением даст ещё одну перезагрузку
+    lock_files_changed()
+  end
   last_load = now or 0
   LOCKED_TLS = {}
   LOCKED_HTTP = {}
@@ -257,12 +292,13 @@ local function load_locked_tables()
   end
 end
 
-function locked_strategy_for_profile(profile, proto, scope)
+-- Поиск по уже загруженным таблицам (без перезагрузки): circular_locked
+-- проверяет файлы один раз и затем делает несколько поисков (родители, профиль).
+local function locked_lookup(profile, proto, scope)
   if not profile then return nil end
   profile = string.lower(tostring(profile))
   proto = string.lower(tostring(proto or "tls"))
   scope = string.lower(tostring(scope or "default"))
-  load_locked_tables()
   local values = lock_table(proto)
   local function lookup(candidate)
     local conflicts = LOCKED_CONFLICTS[candidate]
@@ -272,6 +308,12 @@ function locked_strategy_for_profile(profile, proto, scope)
   local result, conflict = lookup(scope)
   if result ~= nil or conflict or scope == "default" then return result end
   return lookup("default")
+end
+
+function locked_strategy_for_profile(profile, proto, scope)
+  if not profile then return nil end
+  load_locked_tables(true)
+  return locked_lookup(profile, proto, scope)
 end
 
 function locked_strategy_for_scope(scope, profile, proto)
@@ -289,13 +331,10 @@ function locked_load_lines_for_tests(lines)
   load_locked_tables()
 end
 
--- Тестовый загрузчик per-mark файла: чистые таблицы + один файл под своим скоупом.
+-- Тестовый загрузчик per-mark файла: поверх уже загруженных строк, как в
+-- load_locked_tables (общий файл + per-mark), чтобы проверять утечку в default.
 function locked_load_scoped_file_for_tests(path, scope)
-  LOCKED_TEST_LINES = nil
   last_load = os.time() or 0
-  LOCKED_TLS, LOCKED_HTTP, LOCKED_UDP = {}, {}, {}
-  LOCKED_CONFLICTS, LOCKED_CONFLICTS_TOTAL = {}, 0
-  CLIENT_SCOPE_SCOPED_LOCK_COUNT = 0
   load_scoped_file(path, scope)
 end
 
@@ -329,7 +368,7 @@ end
 local function load_exclude_hostlist(path)
   local cached = EXCLUDE_HOSTLISTS[path]
   local now = os.time() or 0
-  if cached and (now - cached.loaded_at) < cache_ttl then
+  if cached and now >= cached.loaded_at and (now - cached.loaded_at) < cache_ttl then
     return cached.hosts
   end
 
@@ -365,7 +404,7 @@ end
 local function load_substring_hostlist(path)
   local cached = SUBSTRING_HOSTLISTS[path]
   local now = os.time() or 0
-  if cached and (now - cached.checked_at) < cache_ttl then
+  if cached and now >= cached.checked_at and (now - cached.checked_at) < cache_ttl then
     return cached
   end
 
@@ -395,7 +434,8 @@ local function load_substring_hostlist(path)
     mtime = file_stat and file_stat.mtime,
     size = file_stat and file_stat.size,
     needles = needles,
-    matches = {}
+    matches = {},
+    match_count = 0
   }
   SUBSTRING_HOSTLISTS[path] = cached
   return cached
@@ -409,6 +449,9 @@ function substring_hostlist_matches(path, host)
   local list = load_substring_hostlist(path)
   local matched = list.matches[host]
   if matched ~= nil then return matched end
+  -- кеш по каждому новому хосту рос бы до рестарта nfqws2: сбрасываем целиком
+  if list.match_count >= 4096 then list.matches, list.match_count = {}, 0 end
+  list.match_count = list.match_count + 1
   for _, needle in ipairs(list.needles) do
     if string.find(host, needle, 1, true) then
       list.matches[host] = true
@@ -587,6 +630,8 @@ local function desync_proto(desync)
   end
   return "tls"
 end
+-- Тот же выбор proto для сида авторотации (slm_seed_strategy в combined-detector).
+desync_lock_proto = desync_proto
 
 function desync_allow_nohost(desync)
   local allow_nohost = desync.arg and desync.arg.allow_nohost
@@ -676,12 +721,13 @@ end
 -- signature_algorithms (13), renegotiation_info (0xff01) не удаляются никогда.
 local Z2R_CLONE_CUT_GROUPS = {
   { t = { [0xfe0d] = true } },                            -- ECH: фейку не нужен
-  { t = { [51] = true, [10] = true, [11] = true } },      -- key_share + supported_groups + ec_point_formats
   { t = { [21] = true } },                                -- padding
   { grease = true },                                      -- GREASE-расширения
   { t = { [35] = true } },                                -- session_ticket
   { t = { [16] = true } },                                -- ALPN
   { t = { [45] = true, [41] = true, [42] = true } },      -- psk_key_exchange_modes + pre_shared_key + early_data
+  -- крайняя мера: TLS1.3 CH без key_share ТСПУ режет (см. drop_pq ниже)
+  { t = { [51] = true, [10] = true, [11] = true } },      -- key_share + supported_groups + ec_point_formats
 }
 
 -- Классические (не post-quantum) записи key_share: secp256r1/secp384r1/
@@ -721,7 +767,7 @@ end
 -- Согласованная резка ClientHello до <= limit: сначала точечная операция на
 -- key_share (PQ-записи — главный источник размера), затем расширения снимаются
 -- группами из Z2R_CLONE_CUT_GROUPS, пока оценка размера не войдёт в лимит;
--- затем один tls_reconstruct. Не CH / не влезли минимальным набором — nil
+-- затем tls_reconstruct (не влез — следующая группа). Не CH / не влезли минимальным набором — nil
 -- (фейк не шлём: отравленный фейк хуже отсутствия, см. эксперимент 03.10).
 local function z2r_clone_semantic_cut(clone, limit)
   if type(clone) ~= "string" or #clone <= limit then return nil end
@@ -759,8 +805,9 @@ local function z2r_clone_semantic_cut(clone, limit)
       saved = saved + removed
       if #clone - saved <= limit then
         local ok2, cut = pcall(tls_reconstruct, tdis)
-        if ok2 and type(cut) == "string" and #cut > 0 and #cut <= limit then return cut end
-        return nil
+        if not ok2 then return nil end
+        if type(cut) == "string" and #cut > 0 and #cut <= limit then return cut end
+        -- оценка занижена (ext.data key_share после drop_pq устарел) — режем дальше
       end
     end
   end
@@ -770,14 +817,17 @@ end
 -- Сырая резка цепочки TLS-рекордов до <= limit: рекорды целиком помещаются,
 -- последний режется с починкой длины рекорда (валидность структуры на проводе
 -- подтверждена экспериментом 03.10: раздутый нулями рекорд с починкой длины
--- ТСПУ пропускает). Не TLS (первый байт не 20-23, битая длина) — nil.
+-- ТСПУ пропускает). Не TLS (тип не 20-23, версия не 3.x) — nil; обрезанный
+-- последний рекорд (длина больше фактических байт) режется по факту.
 local function z2r_tls_record_cut(data, limit)
   if type(data) ~= "string" or #data <= limit then return nil end
   local out, off = "", 1
   while #data - off + 1 >= 5 do
     local rtype = string.byte(data, off)
     local rlen = string.byte(data, off + 3) * 256 + string.byte(data, off + 4)
-    if rtype < 20 or rtype > 23 or #data - off + 1 < 5 + rlen then return nil end
+    if rtype < 20 or rtype > 23 or string.byte(data, off + 1) ~= 3 then return nil end
+    -- последний рекорд обрезан (блоб снят/урезан руками): режем по факту
+    if #data - off + 1 < 5 + rlen then rlen = #data - off + 1 - 5 end
     if off - 1 + 5 + rlen <= limit then
       out = out .. string.sub(data, off, off + 4 + rlen)
       if off - 1 + 5 + rlen == limit then return out end
@@ -1092,8 +1142,12 @@ function circular_locked(ctx, desync)
   end
 
   local hrec
-  if desync.track then
-    hrec = automate_host_record(desync)
+  -- Шлюз «нет ключа хоста» как у automate_host_record, но без autostate: там
+  -- запись на каждый хост не вытесняется (утечка памяти nfqws2), а ctstrategy
+  -- плана дешевле пересчитать, чем копить.
+  -- standard_hostkey есть в апстриме с v0.8.x; на старых сборках — прежний шлюз по track
+  if desync.track and (type(standard_hostkey) ~= "function" or standard_hostkey(desync)) then
+    hrec = {}
   end
   if not hrec then
     if allow_nohost_enabled then
@@ -1106,9 +1160,25 @@ function circular_locked(ctx, desync)
   end
 
   local scope = desync_client_scope(desync)
-  local locked = locked_strategy_for_profile(profile, proto, scope)
+  -- stat lock-файлов — только на первом вызове соединения (UDP-профили зовут
+  -- circular_locked на каждый пакет in-range); дальше работает обычный TTL.
+  local lua_state = desync.track and desync.track.lua_state
+  load_locked_tables(not (lua_state and lua_state.z2r_locks_checked))
+  if lua_state then lua_state.z2r_locks_checked = true end
+  local locked = locked_lookup(profile, proto, scope)
+  -- Доменный лок действует и на поддомены (как хостлист): www.example.com
+  -- берёт строку example.com; ближайшая строка выигрывает, TLD и IP не ищем.
+  local parent = profile ~= base_profile and not string.match(profile, "^[%d.]+$")
+    and string.match(profile, "^[^.]+%.(.+%..+)$")
+  while locked == nil and parent do
+    locked = locked_lookup(parent, proto, scope)
+    if locked ~= nil then
+      DLOG("circular_locked: parent lock profile="..parent.." for host profile="..profile)
+    end
+    parent = string.match(parent, "^[^.]+%.(.+%..+)$")
+  end
   if (not locked) and profile ~= base_profile then
-    locked = locked_strategy_for_profile(base_profile, proto, scope)
+    locked = locked_lookup(base_profile, proto, scope)
     if locked then
       DLOG("circular_locked: fallback lock profile="..base_profile.." for host profile="..profile)
     end

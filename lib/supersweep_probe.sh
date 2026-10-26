@@ -94,18 +94,27 @@ supersweep_probe_config() {
 }
 
 supersweep_probe_stop() {
+    local rc=0 locked=0
     # Сначала убрать маршрутизацию; затем остановить ТОЛЬКО своего ребёнка.
     if [ "${Z2R_SUPERSWEEP_TRANSPORT_ACTIVE:-0}" = 1 ]; then
+        # transport.env убираем под lock транспорта ДО очистки: ndm-hook,
+        # уже прочитавший его, иначе переставит правила после нас (сироты).
+        # Lock мёртвого владельца не держит очистку дольше таймаута.
+        _supersweep_transport_lock && locked=1
+        rm -f "${Z2R_SUPERSWEEP_DIR:-/tmp/z2r-supersweep}/probe/transport.env" 2>/dev/null
         # Старый iptables без -w может упереться в чужой xtables lock — это
         # транзиент, ретраим, иначе очистка бросит живой пробник и lock.
         local t=0
         until supersweep_transport_stop; do
             t=$((t + 1))
-            [ "$t" -lt 3 ] || return 1
+            [ "$t" -lt 3 ] || { rc=1; break; }
             sleep 1
         done
-        Z2R_SUPERSWEEP_TRANSPORT_ACTIVE=0
+        [ "$locked" = 0 ] || _supersweep_transport_unlock
+        [ "$rc" = 1 ] || Z2R_SUPERSWEEP_TRANSPORT_ACTIVE=0
     fi
+    # --queue-bypass: без слушателя очереди пакеты проходят, поэтому пробник
+    # останавливаем и при неубранных правилах — иначе он держит очередь 65535.
     if [ -n "${Z2R_SUPERSWEEP_NFQ_PID:-}" ]; then
         kill "$Z2R_SUPERSWEEP_NFQ_PID" 2>/dev/null || true
         wait "$Z2R_SUPERSWEEP_NFQ_PID" 2>/dev/null || true
@@ -113,6 +122,7 @@ supersweep_probe_stop() {
     fi
     rm -f "${Z2R_SUPERSWEEP_DIR:-/tmp/z2r-supersweep}/probe/transport.env" 2>/dev/null
     unset Z2R_TLS_LOCAL_PORTS
+    return "$rc"
 }
 
 supersweep_probe_healthy() {

@@ -439,8 +439,13 @@ orch_locked_rename_everywhere() {
   return "$rc"
 }
 
+# Боевой nfqws2: проба фонового суперсвипа (qnum=65535) не считается.
 zapret2_running() {
-  pidof nfqws2 >/dev/null 2>&1
+  local pid
+  for pid in $(pidof nfqws2 2>/dev/null); do
+    grep -aq 'qnum=65535' "/proc/$pid/cmdline" 2>/dev/null || return 0
+  done
+  return 1
 }
 
 # --- Состояние профилей: единственный источник — locked.tsv ---

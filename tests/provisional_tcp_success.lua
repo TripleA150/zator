@@ -123,6 +123,22 @@ assert(not combined_failure_detector(abort, abort_crec), "client RST failure mus
 abort_crec = { tcp_in_count = 1, validated_success = true }
 assert(not combined_failure_detector(abort, abort_crec), "validated connection client RST must stay benign")
 
+-- TLS 1.2 keeps the alert type on encrypted records: close_notify and
+-- warnings are not failures, a plaintext fatal alert still is. TLS ciphertext
+-- of a 1792-2047 byte record used to parse as an HTTP/2 GOAWAY.
+local function tls_in(...)
+    return { outgoing = false, dis = { tcp = { th_flags = 0 }, payload = string.char(...) }, track = {}, arg = {} }
+end
+local close_notify = tls_in(0x15, 3, 3, 0, 0x1a)
+close_notify.dis.payload = close_notify.dis.payload .. string.rep(string.char(0x5a), 26)
+assert(not combined_failure_detector(close_notify, {}), "encrypted TLS 1.2 close_notify must not fail")
+assert(combined_success_detector(close_notify, {}) ~= false, "encrypted TLS 1.2 close_notify must not veto success")
+assert(not combined_failure_detector(tls_in(0x15, 3, 1, 0, 2, 1, 112), {}), "warning TLS alert must not fail")
+assert(combined_failure_detector(tls_in(0x16, 3, 3, 0, 2, 2, 0, 0x15, 3, 3, 0, 2, 2, 40), {}), "plaintext fatal TLS alert must fail")
+local tls_flight = tls_in(0x16, 3, 3, 7, 0x30)
+tls_flight.dis.payload = tls_flight.dis.payload .. string.rep(string.char(0x9b), 64)
+assert(not combined_failure_detector(tls_flight, {}), "TLS ciphertext must not parse as HTTP/2 GOAWAY")
+
 local stun_crec = {}
 local stun = {
     outgoing = false,
@@ -160,6 +176,17 @@ G.slm_should_lock = function() lock_checks = lock_checks + 1 return false end
 G.automate_failure_counter_reset = function() reset_calls = reset_calls + 1 end
 G.automate_failure_counter = function() failure_counter_calls = failure_counter_calls + 1 return false end
 G.plan_instance_pop = function() return nil end
+-- Сид/порядок ротации проверяются в tests/slm_seed_rotation.lua; здесь — линейный
+-- перебор поверх замоканного slm_is_blocked, как до их появления.
+G.slm_seed_strategy = function() return 1, "default" end
+G.slm_rotation_next = function(askey, _, cur, ct, _, hostkey)
+    local s = cur
+    for _ = 1, ct do
+        s = (s % ct) + 1
+        if not G.slm_is_blocked(askey, hostkey, s) then return s end
+    end
+    return cur
+end
 G.test_provisional_failure = function() return mock_failure end
 G.test_provisional_success = function(_, crec)
     crec.provisional_success = true
@@ -173,6 +200,21 @@ local empty_ack = {
 }
 circular_quality(nil, empty_ack)
 assert(orchestrate_calls == 0, "empty non-RST TCP packets must bypass orchestration")
+
+-- Upload: the peer only ACKs. An advancing ACK is stall progress, a duplicate is not.
+local up_crec = { tcp_in_count = 1 }
+local up = { outgoing = true, dis = { tcp = { th_flags = 0 }, payload = "upload" }, track = {}, arg = { stall_out = 3 } }
+local ack = { outgoing = false, dis = { tcp = { th_flags = 0, th_ack = 0 }, payload = "" }, track = {}, _crec = up_crec }
+for i = 1, 6 do
+    assert(not combined_failure_detector(up, up_crec), "acknowledged upload must not stall")
+    ack.dis.tcp.th_ack = i
+    circular_quality(nil, ack)
+end
+for i = 1, 4 do
+    circular_quality(nil, ack)
+    assert(combined_failure_detector(up, up_crec) == (i == 4), "duplicate ACKs must not hide a stall")
+end
+assert(orchestrate_calls == 0, "pure ACK accounting must still bypass orchestration")
 
 -- Auto counterparts of fallback/substrings blocks must retain circular_locked
 -- routing: they are not catch-all and route matching no-host traffic to key 3.
@@ -242,6 +284,45 @@ assert(result_calls == 0 and circular._hrec.locked_fail_count == 2, "provisional
 mock_failure = true
 circular_quality(nil, circular)
 assert(result_calls == 1 and circular._hrec.locked_fail_count == 3, "late failure must advance locked auto-unlock streak")
+
+-- Locked failures further apart than time= are not a streak.
+circular._hrec = { locked_fail_count = 2, locked_fail_time = os.time() - 120 }
+circular._crec = {}
+circular_quality(nil, circular)
+assert(circular._hrec.locked_fail_count == 1, "old locked failures must decay")
+-- A connection desynced by another strategy says nothing about the lock.
+circular._hrec = { locked_fail_count = 2 }
+circular._crec = { strategy = 2 }
+circular_quality(nil, circular)
+assert(circular._hrec.locked_fail_count == 2, "stale connection must not advance locked streak")
+
+-- Unlocked: a failure of a rotated-away strategy is recorded for that
+-- strategy but must not rotate again; a pending validation freezes rotation.
+local recorded = {}
+local prior_record = G.slm_record_result
+G.slm_record_result = function(_, _, strategy) recorded[#recorded + 1] = strategy end
+mock_locked, failure_counter_calls = nil, 0
+circular._hrec = { nstrategy = 2, ctstrategy = 2 }
+circular._crec = { strategy = 1 }
+circular_quality(nil, circular)
+assert(failure_counter_calls == 0 and recorded[1] == 1, "stale failure must be charged to its own strategy without rotation")
+circular._hrec = { nstrategy = 1, validator_pending = { id = "1" } }
+circular._crec = {}
+circular_quality(nil, circular)
+assert(failure_counter_calls == 0, "pending validation must freeze rotation")
+circular._hrec = {}
+circular._crec = {}
+circular_quality(nil, circular)
+assert(failure_counter_calls == 1, "current strategy failure must still count")
+-- The first outgoing request pins the connection's strategy.
+mock_failure = false
+circular._crec = {}
+circular.outgoing, circular.dis = true, { tcp = { th_flags = 0 }, payload = "client hello" }
+circular_quality(nil, circular)
+assert(circular._crec.strategy == 1, "first outgoing request must pin the connection strategy")
+circular.outgoing, circular.dis = nil, nil
+G.slm_record_result = prior_record
+mock_failure = true
 
 -- Validator queue: use an in-memory /tmp and a fake background launcher.
 local files, now = {}, 100

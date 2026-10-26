@@ -144,6 +144,11 @@ ERR_SERVICE = "Не удалось выполнить команду zapret2"
 
 AUTO_MODE_GATED_PROFILES = (1, 2, 3, 4)
 
+# require_post_same_origin() — _lib.sh: мутирующие эндпоинты. Первые три
+# вызываются только POST (GET -> 405); у всех POST сверяется Origin/Referer.
+POST_ONLY_ENDPOINTS = {"service", "set-lock", "clear-lock"}
+STATE_CHANGING_ENDPOINTS = POST_ONLY_ENDPOINTS | {"settings", "domains", "backups"}
+
 # Допустимые эндпоинты для --simulate-error
 SIMULATABLE = {"status", "scopes", "service", "check", "set-lock", "clear-lock", "settings", "domains", "backups"}
 
@@ -1265,33 +1270,39 @@ def _dns_desync_set_skip(cfg_text, want_on):
 def _apply_rst_guard(cfg_text, want_on):
     """backup_smart_set_rst_guard() — lib/actions.sh."""
     src, dst = ("circular_locked", "rst_guard_locked") if want_on else ("rst_guard_locked", "circular_locked")
+    base = "--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello"
     result = []
     in_fb = False
+    in_auto = False
     for line in cfg_text.splitlines():
         if re.match(r"^\s*#Z2R_FALLBACK_BEGIN\s*$", line):
             in_fb = True
         elif re.match(r"^\s*#Z2R_FALLBACK_END\s*$", line):
             in_fb = False
+        if re.match(r"^\s*#Z2R_AUTO_STANDARD_BEGIN\s*$", line):
+            in_auto = True
+        elif re.match(r"^\s*#Z2R_AUTO_STANDARD_END\s*$", line):
+            in_auto = False
         if in_fb:
             if want_on:
                 if re.match(r"^--filter-tcp=443 --filter-l7=tls$", line):
                     line = "--filter-tcp=443"
                 elif re.match(r"^--skip --filter-tcp=443 --filter-l7=tls$", line):
                     line = "--skip --filter-tcp=443"
-                line = line.replace(
-                    "--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello",
-                    "--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty")
             else:
                 if re.match(r"^--filter-tcp=443$", line):
                     line = "--filter-tcp=443 --filter-l7=tls"
                 elif re.match(r"^--skip --filter-tcp=443$", line):
                     line = "--skip --filter-tcp=443 --filter-l7=tls"
-                line = line.replace(
-                    "--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello,empty",
-                    "--payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello")
+        # RST без payload — тип empty: без него rst_guard не видит RST профилей 1-4/8.
+        if in_auto:
+            if want_on and line == base:
+                line = base + ",empty"
+            elif not want_on and line == base + ",empty":
+                line = base
         for key in RST_GUARD_KEYS:
-            line = line.replace("--lua-desync={0}:key={1}".format(src, key),
-                                "--lua-desync={0}:key={1}".format(dst, key))
+            line = line.replace("--lua-desync={0}:key={1}:".format(src, key),
+                                "--lua-desync={0}:key={1}:".format(dst, key))
         result.append(line)
     return "\n".join(result) + ("\n" if cfg_text.endswith("\n") else "")
 
@@ -2781,6 +2792,15 @@ class FakeRouterHandler(BaseHTTPRequestHandler):
                 params[k] = v[-1]
         return parsed, params
 
+    def _same_origin(self):
+        """require_post_same_origin() — _lib.sh: хост Origin (или Referer)
+        равен Host; заголовка нет — пропускаем."""
+        origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        if not origin:
+            return True
+        host = origin.split("://", 1)[-1].split("/", 1)[0]
+        return host == (self.headers.get("Host") or "")
+
     def _serve_static(self, relpath):
         """Отдаёт реальные файлы из webui/ как есть."""
         webui_root = self.server.webui_root
@@ -2820,6 +2840,15 @@ class FakeRouterHandler(BaseHTTPRequestHandler):
             snapshot = self.state.dev_snapshot()
             running = snapshot["nfqws2_running"]
             locks = snapshot["locks"]
+
+        if endpoint in STATE_CHANGING_ENDPOINTS:
+            if self.command != "POST":
+                if endpoint in POST_ONLY_ENDPOINTS:
+                    self._send_error_json(405, "Только POST")
+                    return
+            elif not self._same_origin():
+                self._send_error_json(403, "Чужой источник запроса")
+                return
 
         # --simulate-error: эндпоинт падает 500
         if endpoint in self.state.simulate_error:
@@ -3016,7 +3045,8 @@ class FakeRouterHandler(BaseHTTPRequestHandler):
             if scope == "default":
                 ok = profile_state_set_and_apply(self.state, int(profile), pl, strategy)
             else:
-                orch_scoped_set(self.state.lock_file, scope, profile, profile_proto(int(profile)), strategy)
+                for proto in pl.split():
+                    orch_scoped_set(self.state.lock_file, scope, profile, proto, strategy)
                 ok = True
             if not ok:
                 self._send_error_json(500, ERR_SAVE_STATE)
@@ -3053,7 +3083,8 @@ class FakeRouterHandler(BaseHTTPRequestHandler):
             if scope == "default":
                 ok = profile_state_set_and_apply(self.state, int(profile), pl, "auto")
             else:
-                orch_scoped_clear(self.state.lock_file, scope, profile, profile_proto(int(profile)))
+                for proto in pl.split():
+                    orch_scoped_clear(self.state.lock_file, scope, profile, proto)
                 ok = True
             if not ok:
                 self._send_error_json(500, ERR_RESET_STATE)
