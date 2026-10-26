@@ -144,10 +144,11 @@ assert(d.arg.key=='3')
 
 ctx,d=fixture()
 d.arg.allow_nohost=nil
-local host_record=automate_host_record
+local host_record,host_key=automate_host_record,standard_hostkey
 automate_host_record=function() return nil end
+standard_hostkey=function() return nil end
 assert_lazy(ctx,d,'missing required host record')
-automate_host_record=host_record
+automate_host_record,standard_hostkey=host_record,host_key
 print('PASS early gates cancel without native-plan allocation')
 
 ctx,d=fixture('empty')

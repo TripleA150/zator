@@ -147,12 +147,13 @@ function dnsclone(ctx, desync)
     if arg.resend == "1" then
         local orig = deepcopy(dis)
         apply_ip_id(desync, orig, nil, "rnd")
-        if not rawsend_dissect_ipfrag(orig, desync_opts(desync)) then
-            DLOG("dnsclone: rawsend original failed")
-        else
+        local oopts = desync_opts(desync)
+        oopts.reconstruct = nil -- badsum is for the clone only
+        if rawsend_dissect_ipfrag(orig, oopts) then
             DLOG("dnsclone: original resent via rawsend, dropping verdict packet")
+            return VERDICT_DROP
         end
-        return VERDICT_DROP
+        DLOG("dnsclone: rawsend original failed, passing verdict packet")
     end
 
     return

@@ -65,7 +65,7 @@ G.DESYNC_MARK_POSTNAT = 0x20000000
 G.VERDICT_PASS = 0
 G.DLOG = function() end
 G.orchestrate = function() end
-G.automate_host_record = function() return {} end
+G.standard_hostkey = function(desync) return desync.hostname end
 G.plan_instance_pop = function(desync)
   return table.remove(desync.plan, 1)
 end
@@ -134,6 +134,17 @@ G.locked_load_lines_for_tests({"mark:1\texample.com\ttls\t2", "default\texample.
 strategy, scope = run_circular(0x0100, "example.com", "example.com")
 assert(strategy == 1 and scope == "default",
   "missing runtime config must preserve the safe default scope")
+
+-- Доменный лок действует на поддомены (как хостлист): ближайшая строка
+-- выигрывает, лок 0 родителя отключает поддомены, профиль — запасной.
+G.execution_plan_cancel = function() end
+G.plan_clear = function() end
+G.locked_load_lines_for_tests({"example.com\ttls\t2", "a.example.com\ttls\t1", "off.test\ttls\t0"})
+assert(run_circular(nil, "www.example.com", "3") == 2, "subdomain must inherit the parent domain lock")
+assert(run_circular(nil, "x.a.example.com", "3") == 1, "the most specific parent row must win")
+assert(run_circular(nil, "cdn.off.test", "3") == nil, "parent lock 0 must disable subdomains")
+G.locked_load_lines_for_tests({"3\ttls\t2"})
+assert(run_circular(nil, "www.other.org", "3") == 2, "no domain row must fall back to the profile lock")
 
 print("client scope parser ok")
 

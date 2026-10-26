@@ -28,6 +28,8 @@ local SLM_AUTO_LOCKED_PATH = "/tmp/auto_locked.tsv"
 local SLM_AUTO_LOCKED_BACKUP_PATH = "/opt/zator/extra_strats/cache/orchestra/auto_locked.tsv"
 local SLM_AUTO_LOCKED_BACKUP_INTERVAL = 1800
 local SLM_AUTO_LOCKED_LAST_BACKUP = 0
+-- Changes skipped by the backup interval; flushed by slm_flush_auto_locked_backup.
+local SLM_AUTO_LOCKED_BACKUP_DIRTY = false
 
 -- ==================== SEPARATE SUBDOMAINS ====================
 -- Domains that should NOT be grouped by NLD (need separate strategies)
@@ -463,10 +465,12 @@ local function slm_get_quality_bucket(askey, scope)
 end
 
 -- Serializes the whole SLM_AUTO_LOCKED table to `path`. Returns true on
--- success, false if the file couldn't be opened for writing.
+-- success, false if the file couldn't be opened or written (ENOSPC: an empty
+-- or partial tmp must not replace the good file).
 local function slm_write_auto_locked_to(path)
     local f = io.open(path, "w")
     if not f then return false end
+    local ok = true
     for askey, scopes in pairs(SLM_AUTO_LOCKED) do
         if type(scopes) == "table" then
             for scope, hosts in pairs(scopes) do
@@ -474,9 +478,9 @@ local function slm_write_auto_locked_to(path)
                     for host, strat in pairs(hosts) do
                         if type(strat) == "number" then
                             if scope == "default" then
-                                f:write(askey, "\t", host, "\t", tostring(strat), "\n")
+                                ok = f:write(askey, "\t", host, "\t", tostring(strat), "\n") and ok
                             else
-                                f:write(askey, "\t", scope, "\t", host, "\t", tostring(strat), "\n")
+                                ok = f:write(askey, "\t", scope, "\t", host, "\t", tostring(strat), "\n") and ok
                             end
                         end
                     end
@@ -484,8 +488,8 @@ local function slm_write_auto_locked_to(path)
             end
         end
     end
-    f:close()
-    return true
+    local closed = f:close()
+    return (ok and closed) and true or false
 end
 
 -- Atomically replaces `path`, so readers never see a partially written TSV.
@@ -513,12 +517,31 @@ local function slm_save_auto_locked()
         now < SLM_AUTO_LOCKED_LAST_BACKUP or
         now - SLM_AUTO_LOCKED_LAST_BACKUP >= SLM_AUTO_LOCKED_BACKUP_INTERVAL
 
+    SLM_AUTO_LOCKED_BACKUP_DIRTY = true
     if not active_saved or backup_due then
         if slm_write_auto_locked_atomic(SLM_AUTO_LOCKED_BACKUP_PATH) then
             SLM_AUTO_LOCKED_LAST_BACKUP = now
+            SLM_AUTO_LOCKED_BACKUP_DIRTY = false
         elseif DLOG then
             DLOG("slm_quality: failed to back up auto locks to " .. SLM_AUTO_LOCKED_BACKUP_PATH)
         end
+    end
+end
+
+-- Deferred backup: the last changes inside an interval used to stay in /tmp
+-- only and were lost on reboot when nothing changed afterwards. Called on
+-- every lookup, so it must stay cheap until the interval has passed.
+local function slm_flush_auto_locked_backup()
+    if not SLM_AUTO_LOCKED_BACKUP_DIRTY then return end
+    local now = os.time()
+    if now >= SLM_AUTO_LOCKED_LAST_BACKUP and
+        now - SLM_AUTO_LOCKED_LAST_BACKUP < SLM_AUTO_LOCKED_BACKUP_INTERVAL then return end
+    -- a failed write is retried after the next interval, not on every packet
+    SLM_AUTO_LOCKED_LAST_BACKUP = now
+    if slm_write_auto_locked_atomic(SLM_AUTO_LOCKED_BACKUP_PATH) then
+        SLM_AUTO_LOCKED_BACKUP_DIRTY = false
+    elseif DLOG then
+        DLOG("slm_quality: failed to back up auto locks to " .. SLM_AUTO_LOCKED_BACKUP_PATH)
     end
 end
 
@@ -760,6 +783,7 @@ end
 --- @param hostkey string Имя хоста (будет нормализовано)
 --- @return number|nil strategy_id Залоченная стратегия или nil
 function slm_get_locked(askey, hostkey, scope)
+    slm_flush_auto_locked_backup()
     if not hostkey then return nil end
 
     -- Нормализуем askey
