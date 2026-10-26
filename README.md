@@ -25,7 +25,7 @@ YouTube без ограничений и рекламы, работа войсо
 
 **Установка/обновление/подбор стратегий** (копируйте и вставляйте в SSH):
 ```bash
-curl -O https://raw.githubusercontent.com/AloofLibra/z4r/z2r/z2r && sh z2r
+curl -O https://raw.githubusercontent.com/TripleA150/zator/zator/z2r.sh && sh z2r
 ```
 
 **После запуска:**
